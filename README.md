@@ -1,12 +1,24 @@
 # Bond Research Engine
 
-운용사·학술 연구를 실행 가능한 Rule로 변환하고, 미국 채권 ETF로 백테스트한 뒤 PIMCO Active Bond ETF(BOND)와 비교하는 Streamlit 연구 플랫폼입니다.
+운용사·학술 연구를 실행 가능한 Rule로 변환하고, 미국 채권 ETF로 백테스트한 뒤 PIMCO Active Bond ETF(BOND)의 행동과 비교하는 Streamlit 연구 플랫폼입니다.
 
 ```text
 운용사·학술 연구 → Rule Library → ETF Mapping → Python Engine → Backtest → PIMCO BOND 역설계
 ```
 
 기본 운용 유니버스는 SHY, IEF, TLT, TIP, LQD, HYG, MBB의 7개 ETF입니다. Structured Proxy 실험군은 BOND의 구조화채권 빈칸을 보기 위해 JAAA, BKLN, CMBS를 별도로 추가합니다.
+
+## 전략 해석
+
+이 저장소의 대표 전략인 `Risk-First Bond Signal Engine`은 BOND를 독립적으로 복제하는 전략이 아닙니다. 정상 국면에서는 BOND와 구조화채권/크레딧 carry sleeve를 함께 쓰고, 위험 국면에서는 BOND 대신 SGOV/BIL/USFR, SHY, IEF, TLT 같은 방어 버킷으로 이동할 수 있는 **BOND + overlay 연구 전략**입니다.
+
+따라서 성과 해석의 기본 벤치마크는 AGG이며, BOND는 다음 용도로 분리해서 사용합니다.
+
+- 상대 성과와 위험조정 초과수익을 참고하는 비교 자산
+- N-PORT 보유내역을 통해 액티브 채권 운용사의 행동을 역분석하는 관찰 대상
+- 포지션 유사도나 구조화채권 빈칸을 진단하는 기준
+
+`Rule Engine`은 BOND를 보유하지 않는 ETF-only 룰 전략이고, `Observed IF-THEN Rulebook`은 검증된 매매 규칙이 아니라 BOND 운용 행동에 대한 탐색적 가설입니다.
 
 ## 실행
 
@@ -67,7 +79,7 @@ FRED_API_KEY = "your_fred_api_key"
 - Credit Cushion은 HY OAS·IG OAS의 5년 백분위, HY 스프레드 3개월 변화, HYG/LQD 상대가격 확인을 함께 사용합니다. 실제 신규발행 할인이나 CLO 종목선택을 직접 관찰한 값은 아닙니다.
 - Curve Roll-down은 5-10년/10-30년 커브와 10Y-2Y steepening 여부를 사용하고, Real Yield는 10년 실질금리 백분위와 TIP-IEF 상대수익을 사용합니다.
 - Alpha Source Attribution은 전월 말 점수판이 다음 달 Alpha Return, AGG 대비 초과수익, BOND 대비 격차를 얼마나 설명했는지 Dominant Alpha별·점수별로 보여줍니다.
-- 일반 알파 목표는 분기말에만 변경합니다. HY 스프레드 충격, `VIX 3년 백분위 90% 이상 또는 MOVE ≥ 110 및 3년 백분위 85% 이상`, 실업 악화, NFCI 스트레스, HYG 가격붕괴 중 3개 이상이면 일별로 SHY 100% 전환하고 최소 20거래일과 5일 연속 해제 후 재진입합니다.
+- Risk gate는 지표별 중복 투표가 아니라 독립 pillar 기준으로 계산합니다. Credit(HY OAS/HYG 상대가격), Rates(MOVE/금리 급등), Liquidity(NFCI), Labor(실업률), Equity Volatility(VIX) 중 2개 이상이 악화하면 severe risk로 보고, 현금 게이트는 최소 20거래일 유지와 5거래일 연속 해제를 요구합니다.
 - 대시보드는 같은 v2 규칙에서 `VIX 또는 MOVE`, VIX만, MOVE만 사용한 반사실 성과를 함께 표시합니다.
 - 위 임계값은 35개월 표본에서 확정된 규칙이 아니라 향후 표본 외 검증이 필요한 가설입니다.
 - BOND Exposure Replica는 `SHY 5% / IEF 25% / TLT 5% / TIP 5% / LQD 15% / HYG 5% / MBB 40%`를 전략적 출발점으로 사용합니다.
@@ -93,10 +105,11 @@ FRED_API_KEY = "your_fred_api_key"
 - 2019년 9월 이후 BOND N-PORT의 다음 분기 포지션 변화를 예측 대상으로 사용합니다.
 - 시장 입력은 국채금리, 실질금리, 커브, IG/HY OAS, 모기지 스프레드, 물가·성장·실업, VIX, NFCI입니다.
 - Duration, 5Y/10Y/30Y Key Rate Duration, Agency MBS, Credit, Gross/Net, 금리파생 명목금액의 변화를 각각 탐색합니다.
-- 시간순 앞 70%에서 시장 변수의 25·33·50·67·75 분위수를 탐색하고, 뒤 30%는 임계값을 다시 맞추지 않는 OOS 구간으로 둡니다.
-- 학습 구간에서 최소 4개 조건 관측, 적중률 55%, baseline 대비 Lift 8%p를 요구합니다.
+- 시간순 앞 70%에서 시장 변수의 25·33·50·67·75 분위수를 탐색하고, 뒤 30%는 임계값을 다시 맞추지 않는 holdout 검증 구간으로 둡니다. 현재 구현의 OOS는 최종 untouched test가 아니라 검증셋에 가깝습니다.
+- 학습 구간에서 최소 8개 조건 관측, 적중률 55%, baseline 대비 Lift 8%p를 요구합니다. A/B 등급은 더 높은 조건부 표본과 OOS 표본 기준을 통과해야 붙습니다.
 - 각 Rule에는 학습 표본 수·적중률·baseline·Lift, OOS 표본 수·적중률, binomial p-value, 탐색횟수 보정값, 경제적 논리를 함께 표시합니다.
 - 후보 A/B는 상대적 증거등급이지 내부 규칙의 확인을 뜻하지 않습니다. 새 공시가 나올 때 임계값을 고정한 채 순차 검증해야 합니다.
+- FRED 거시 데이터는 revised snapshot입니다. CPI, 산업생산, 실업률 같은 지표는 실제 발표일과 ALFRED vintage를 적용하기 전까지 point-in-time 백테스트로 해석하면 안 됩니다.
 
 이 앱은 교육 및 리서치 도구이며 투자자문이나 자동주문 시스템이 아닙니다.
 

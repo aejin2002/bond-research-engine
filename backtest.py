@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from data_sources import CASH_PROXY_TICKERS, ETF_TICKERS, STRUCTURED_PROXY_TICKERS
+from risk_config import RISK_CONFIG
 from signals import ETF_META, FACTOR_WEIGHTS, recommend_weights, score_etfs
 
 
@@ -251,6 +252,28 @@ def _safe_normalize(weights: pd.Series) -> pd.Series:
         result["SHY"] = 1.0
         return result
     return result / total
+
+
+def _strategy_metadata(
+    returns: pd.Series,
+    benchmark: str,
+    parameter_version: str,
+    signal_lag: str,
+    uses_bond_core: bool = False,
+    executed: bool | None = None,
+) -> dict:
+    clean = returns.dropna() if returns is not None else pd.Series(dtype=float)
+    did_execute = bool(len(clean)) if executed is None else bool(executed)
+    return {
+        "strategy_executed": did_execute,
+        "data_start": clean.index.min() if len(clean) else None,
+        "data_end": clean.index.max() if len(clean) else None,
+        "number_of_observations": int(len(clean)),
+        "parameter_version": parameter_version,
+        "signal_lag": signal_lag,
+        "benchmark": benchmark,
+        "uses_bond_core": uses_bond_core,
+    }
 
 
 def _fund_overlay(weights: pd.Series, overlay_amount: float, donors: list[str]) -> pd.Series:
@@ -828,35 +851,40 @@ def _severe_risk_snapshot(prices: pd.DataFrame, fred: pd.DataFrame, date: pd.Tim
     if len(move_history) and isinstance(move_history.index, pd.DatetimeIndex):
         move_history = move_history.loc[move_history.index >= date - pd.DateOffset(years=3)]
     move_pct = float((move_history <= move_history.iloc[-1]).mean()) if len(move_history) else np.nan
-    move_extreme = bool(np.isfinite(move) and move >= 110 and move_pct >= .85)
-    vix_extreme = context["vix_pct"] >= 0.90
+    move_extreme = bool(
+        np.isfinite(move)
+        and move >= RISK_CONFIG.move_level_crisis
+        and move_pct >= RISK_CONFIG.move_percentile_warning
+    )
+    vix_extreme = context["vix_pct"] >= RISK_CONFIG.vix_percentile_crisis
     if vol_signal == "MOVE" and len(move_history):
         volatility_extreme = move_extreme
     elif vol_signal == "VIX":
         volatility_extreme = vix_extreme
     else:
         volatility_extreme = vix_extreme or move_extreme
-    votes = {
-        "HY spread shock": context["hy_3m"] >= 1.00,
-        f"{vol_signal} extreme": volatility_extreme,
-        "Rate shock": volatility_extreme and ten_year_3m >= 0.25,
-        "Labor break": context["unrate_delta"] >= 0.75,
-        "Financial stress": nfci >= 0.50,
-        "Credit price break": hyg_relative_1m <= -0.03,
+    pillars = {
+        "Credit": context["hy_3m"] >= RISK_CONFIG.hy_spread_3m_crisis or hyg_relative_1m <= RISK_CONFIG.hyg_relative_1m_crisis,
+        "Rates": move_extreme or (volatility_extreme and ten_year_3m >= RISK_CONFIG.ten_year_3m_rate_shock),
+        "Liquidity": nfci >= RISK_CONFIG.nfci_crisis,
+        "Labor": context["unrate_delta"] >= RISK_CONFIG.unemployment_gap_crisis,
+        "Equity Vol": vix_extreme,
     }
     warning = (
-        (np.isfinite(move_pct) and move_pct >= 0.90 and ten_year_3m >= 0.15)
+        (np.isfinite(move_pct) and move_pct >= RISK_CONFIG.move_percentile_crisis and ten_year_3m >= 0.15)
         or context["hy_3m"] >= 0.90
         or nfci >= 0.35
     )
-    severe = sum(votes.values()) >= 2 or warning or (context["hy_3m"] >= 1.25 and volatility_extreme)
+    vote_count = int(sum(pillars.values()))
+    severe = vote_count >= RISK_CONFIG.entry_votes or warning or (context["hy_3m"] >= 1.25 and volatility_extreme)
     return bool(severe), {
-        "Risk Votes": int(sum(votes.values())), "HY OAS 3M": context["hy_3m"],
+        "Risk Votes": vote_count, "Risk Pillars": ", ".join(name for name, active in pillars.items() if active) or "None",
+        "HY OAS 3M": context["hy_3m"],
         "Risk Vol Source": vol_signal, "MOVE": move, "MOVE Percentile": move_pct,
         "10Y 3M Change": ten_year_3m,
         "VIX Percentile": context["vix_pct"], "Unemployment Gap": context["unrate_delta"],
         "NFCI": nfci, "HYG vs SHY 1M": hyg_relative_1m,
-        "Triggered": ", ".join(name for name, active in votes.items() if active) or "None",
+        "Triggered": ", ".join(name for name, active in pillars.items() if active) or "None",
     }
 
 
@@ -906,7 +934,7 @@ def run_alpha_replica_backtest(
             in_cash, cash_start, clear_days, reason = True, position, 0, "Severe Risk → Cash"
         elif in_cash:
             clear_days = clear_days + 1 if not severe else 0
-            if position - cash_start >= 10 and clear_days >= 3:
+            if position - cash_start >= RISK_CONFIG.minimum_hold_days and clear_days >= RISK_CONFIG.exit_clear_days:
                 proposed, diagnostics = target_func(prices, fred, date)
                 proposed = proposed.reindex(universe, fill_value=0.0)
                 in_cash, reason = False, "Risk Clear → Re-enter"
@@ -1688,6 +1716,37 @@ def run_backtest(
         "static_metrics": performance_metrics(static, rf, benchmark_returns),
         "target_metrics": performance_metrics(main_target_returns, rf) if main_target_returns is not None else {},
         "benchmark_metrics": performance_metrics(main_benchmark_returns, rf) if main_benchmark_returns is not None else {},
+        "strategy_metadata": {
+            "Rule Engine": _strategy_metadata(returns, "AGG", "static-rule-v1", "month-end signal, next-month return"),
+            "Structured Proxy v2 Candidate": _strategy_metadata(
+                structured_v2_returns, "AGG", "structured-v2-grid-selected", "month-end/quarter-end signal, next-period return"
+            ),
+            MAIN_STRATEGY_NAME: _strategy_metadata(
+                bond_core_overlay_returns,
+                "AGG for market performance; BOND only for relative overlay diagnostics",
+                "bond-core-overlay-v1",
+                "prior signal applied to next monthly return",
+                uses_bond_core=True,
+            ),
+            "PIMCO Active Bond (BOND)": _strategy_metadata(
+                main_target_returns if main_target_returns is not None else pd.Series(dtype=float),
+                "reference asset",
+                "observed",
+                "observed return",
+                executed=main_target_returns is not None,
+            ),
+            "US Aggregate Bond (AGG)": _strategy_metadata(
+                main_benchmark_returns if main_benchmark_returns is not None else pd.Series(dtype=float),
+                "benchmark",
+                "observed",
+                "observed return",
+                executed=main_benchmark_returns is not None,
+            ),
+            "Hybrid Engine": _strategy_metadata(hybrid_returns, "AGG", "disabled", "not executed", executed=False),
+            "BOND Exposure Replica": _strategy_metadata(replica_returns, "BOND", "disabled", "not executed", executed=False),
+            "Alpha Replica v2": _strategy_metadata(alpha_replica_returns, "AGG", "disabled", "not executed", executed=False),
+            "Structured Proxy Engine": _strategy_metadata(structured_returns, "AGG", "disabled", "not executed", executed=False),
+        },
         "common_start": common_start,
         "main_strategy_start": main_strategy_index.min() if len(main_strategy_index) else common_start,
         "transaction_cost_bps": transaction_cost_bps,

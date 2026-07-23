@@ -11,6 +11,7 @@ import streamlit as st
 from backtest import MAIN_STRATEGY_NAME, NORMAL_CARRY_BASKET, infer_long_only_exposures, performance_metrics, run_backtest
 from data_sources import CASH_PROXY_TICKERS, ETF_TICKERS, FRED_SERIES, STRUCTURED_PROXY_TICKERS, FetchStatus, cache_age_minutes, demo_data, fetch_etfs, fetch_fred
 from pimco_holdings import fetch_bond_exposure_history, mbs_gap_diagnostic, position_alignment
+from risk_config import risk_config_summary
 from rule_discovery import discover_if_then_rules
 from rule_library import RULE_FIELDS, RULES, SOURCES
 from signals import FACTOR_WEIGHTS, recommend_weights, score_etfs
@@ -360,6 +361,10 @@ current_strategy_metrics = (
 current_strategy_bond_metrics = results.get("bond_core_overlay_bond_metrics", {}) if current_strategy_name == MAIN_STRATEGY_NAME else {}
 st.title("Bond Research Engine")
 st.caption(f"운용사 연구를 실행 가능한 롱온리 ETF Rule로 변환 · 기준일 {latest_date} · 계산 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+st.info(
+    f"{MAIN_STRATEGY_NAME}는 BOND 복제 전략이 아니라 BOND/현금/구조화채권 ETF를 오가는 core-overlay 연구 전략입니다. "
+    "BOND는 상대 비교와 N-PORT 행동 분석 기준이며, AGG가 기본 성과 벤치마크입니다."
+)
 st.markdown(
     "<div class='pipeline'>운용사·학술 연구　→　Rule Library　→　ETF Mapping　→　Python Engine　→　Backtest　→　PIMCO BOND 역설계</div>",
     unsafe_allow_html=True,
@@ -470,9 +475,9 @@ with tabs[0]:
         )
         st.markdown(
             f"<div class='rule-card'><b>3. Risk Gate</b><br>"
-            f"<span class='muted'>IF NFCI, HY spread, MOVE, labor, or credit price stress appears, THEN the core bucket and overlay both de-risk. "
+            f"<span class='muted'>IF independent credit, rates, liquidity, labor, or equity-volatility pillars deteriorate, THEN the core bucket and overlay both de-risk. "
             f"Rate/MOVE shock uses SGOV/BIL/USFR; recession or flight-to-quality can use IEF/TLT; normal carry uses BOND/structured carry. "
-            f"Now: Stress {stress_label}, Risk votes {risk_votes:.0f}/5.</span></div>",
+            f"{risk_config_summary()} Now: Stress {stress_label}, Risk votes {risk_votes:.0f}/5.</span></div>",
             unsafe_allow_html=True,
         )
         st.markdown(
@@ -609,6 +614,15 @@ with tabs[2]:
             f"BOND 대비 IR {overlay_bond_metrics.get('Information Ratio', np.nan):.2f}."
         )
     st.caption("이 버전은 BOND를 항상 코어로 들고 가지 않습니다. 목표는 채권 급락 레짐을 먼저 피하고, 위험이 낮을 때만 carry/structured sleeve로 수익을 더하는 것입니다.")
+    metadata = pd.DataFrame(results.get("strategy_metadata", {})).T
+    if not metadata.empty:
+        st.subheader("Strategy Execution Metadata")
+        meta_display = metadata.copy()
+        for col in ["data_start", "data_end"]:
+            if col in meta_display:
+                meta_display[col] = meta_display[col].map(lambda x: x.date().isoformat() if pd.notna(x) else "—")
+        st.dataframe(meta_display, width="stretch")
+        st.caption("Disabled rows are intentionally not included in the main comparison. This avoids showing empty research engines as if they were executed strategies.")
     comparison_nav = results["nav"][[col for col in [
         MAIN_STRATEGY_NAME,
         "Structured Proxy v2 Candidate",
@@ -654,7 +668,7 @@ with tabs[2]:
         "Overlay HYG + BKLN", "Overlay Structured", "Overlay Duration Tilt",
         "MBS RV Score", "Credit Cushion Score", "Duration/MOVE Score", "Curve Score", "Real Yield Score",
         "MOVE Percentile", "VIX Percentile", "NFCI", "HY OAS 3M", "10Y 3M Change",
-        "JAAA vs SHY 1M", "BKLN vs SHY 1M", "CMBS vs MBB 3M", "Risk Votes", "Triggered", "Cash Gate",
+        "JAAA vs SHY 1M", "BKLN vs SHY 1M", "CMBS vs MBB 3M", "Risk Votes", "Risk Pillars", "Triggered", "Cash Gate",
     ]
     signal_cols = [col for col in signal_cols if col in results["bond_core_overlay_signals"]]
     main_signals = results["bond_core_overlay_signals"][signal_cols].tail(24).sort_index(ascending=False)

@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from data_sources import ETF_TICKERS
+from risk_config import RISK_CONFIG
 
 
 ETF_META = {
@@ -110,8 +111,13 @@ def score_etfs(prices: pd.DataFrame, fred: pd.DataFrame) -> tuple[pd.DataFrame, 
     hy_oas = _latest(market["BAMLH0A0HYM2"])
     hy_3m = hy_oas - _asof(market["BAMLH0A0HYM2"], market.index.max() - pd.DateOffset(months=3))
     vix_pct = _percentile(market["VIXCLS"], 3)
-    risk_votes = [hy_3m >= 0.75, vix_pct >= 0.80, regime["unrate_delta"] >= 0.5]
-    risk_off = sum(bool(vote) for vote in risk_votes) >= 2
+    risk_pillars = {
+        "Credit": hy_3m >= RISK_CONFIG.hy_spread_3m_warning,
+        "Equity Vol": vix_pct >= RISK_CONFIG.vix_percentile_warning,
+        "Labor": regime["unrate_delta"] >= RISK_CONFIG.unemployment_gap_warning,
+    }
+    risk_votes = sum(bool(vote) for vote in risk_pillars.values())
+    risk_off = risk_votes >= RISK_CONFIG.entry_votes
 
     daily_rets = prices.pct_change(fill_method=None)
     vols = daily_rets.tail(756).std() * np.sqrt(252)
@@ -181,7 +187,8 @@ def score_etfs(prices: pd.DataFrame, fred: pd.DataFrame) -> tuple[pd.DataFrame, 
 
     scored = pd.DataFrame(rows).set_index("Ticker").sort_values("Total Score", ascending=False)
     context = {**regime, "slope": slope, "real_yield": real_yield, "ig_oas": ig_oas,
-               "hy_oas": hy_oas, "hy_3m": hy_3m, "vix_pct": vix_pct, "risk_off": risk_off}
+               "hy_oas": hy_oas, "hy_3m": hy_3m, "vix_pct": vix_pct,
+               "risk_votes": risk_votes, "risk_pillars": risk_pillars, "risk_off": risk_off}
     return scored, context
 
 

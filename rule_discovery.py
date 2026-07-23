@@ -6,6 +6,11 @@ import numpy as np
 import pandas as pd
 
 
+MIN_TOTAL_SAMPLE = 18
+MIN_TRAIN_CONDITIONED = 8
+MIN_OOS_FOR_GRADE = 5
+
+
 FEATURE_META = {
     "10Y Treasury": ("미 10년 국채금리", "%", 2),
     "10Y Treasury 3M Change": ("미 10년 금리 3개월 변화", "%p", 2),
@@ -118,11 +123,11 @@ def discover_if_then_rules(
             continue
         target_delta = panel[delta_col]
         valid_target = target_delta.dropna()
-        if len(valid_target) < 10:
+        if len(valid_target) < MIN_TOTAL_SAMPLE:
             continue
         for feature in FEATURE_META:
             sample = pd.concat([panel[feature], target_delta], axis=1).dropna()
-            if len(sample) < 10 or sample[feature].nunique() < 5:
+            if len(sample) < MIN_TOTAL_SAMPLE or sample[feature].nunique() < 5:
                 continue
             split = max(10, int(len(sample) * .70))
             train, test = sample.iloc[:split], sample.iloc[split:]
@@ -130,7 +135,7 @@ def discover_if_then_rules(
                 for operator in [">=", "<="]:
                     train_condition = train[feature] >= threshold if operator == ">=" else train[feature] <= threshold
                     conditioned = train.loc[train_condition, delta_col]
-                    if len(conditioned) < 4:
+                    if len(conditioned) < MIN_TRAIN_CONDITIONED:
                         continue
                     test_count += 1
                     average_change = conditioned.mean()
@@ -143,12 +148,16 @@ def discover_if_then_rules(
                     oos = test.loc[test_condition, delta_col]
                     oos_successes = int((oos * direction >= minimum_move).sum())
                     oos_hit_rate = oos_successes / len(oos) if len(oos) else np.nan
-                    stable = len(oos) >= 2 and np.sign(oos.mean()) == direction
+                    stable = len(oos) >= MIN_OOS_FOR_GRADE and np.sign(oos.mean()) == direction
                     p_value = _binomial_tail(successes, len(conditioned), baseline)
                     if hit_rate < 0.55 or lift < 0.08 or abs(average_change) < minimum_move * 0.75:
                         continue
                     score = lift + min(abs(average_change) / scale, 1.0) * .15 + (0.10 if stable and oos_hit_rate >= .50 else 0) - p_value * .03
-                    confidence = "후보 A" if len(oos) >= 3 and oos_hit_rate >= .67 and stable else "후보 B" if len(oos) >= 2 and oos_hit_rate >= .50 and stable else "탐색적"
+                    confidence = (
+                        "후보 A" if len(conditioned) >= 12 and len(oos) >= 8 and oos_hit_rate >= .67 and stable
+                        else "후보 B" if len(conditioned) >= 10 and len(oos) >= MIN_OOS_FOR_GRADE and oos_hit_rate >= .60 and stable
+                        else "탐색적"
+                    )
                     condition_text = f"IF {_format_threshold(feature, threshold, operator)}"
                     action = "확대" if direction > 0 else "축소"
                     candidates.append(
@@ -164,6 +173,7 @@ def discover_if_then_rules(
                             "Lift": lift,
                             "OOS 관측 수": len(oos),
                             "OOS 적중률": oos_hit_rate,
+                            "검증 메모": "OOS는 최종 테스트셋이 아니라 holdout 검증 구간입니다. 새 공시에서 순차 검증해야 합니다.",
                             "평균 변화": average_change,
                             "p-value": p_value,
                             "기간 안정성": bool(stable),
