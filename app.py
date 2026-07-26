@@ -67,7 +67,6 @@ def common_rebased_nav(data: pd.DataFrame, base: float = 100.0) -> pd.DataFrame:
     common = frame.dropna(how="any")
     if common.empty:
         return frame
-    common = common.loc[common.index >= common.index.min()]
     return common / common.iloc[0] * base
 
 
@@ -341,11 +340,6 @@ elif not results["structured_v2_weights"].empty:
     current_strategy_weights = results["structured_v2_weights"].iloc[-1].sort_values(ascending=False)
     current_strategy_signal = results["structured_v2_signals"].iloc[-1] if not results["structured_v2_signals"].empty else pd.Series(dtype=object)
     current_strategy_universe = ETF_TICKERS + [ticker for ticker in STRUCTURED_PROXY_TICKERS + CASH_PROXY_TICKERS if ticker in current_strategy_weights.index]
-elif not results["structured_proxy_weights"].empty:
-    current_strategy_name = "Structured Proxy Engine"
-    current_strategy_weights = results["structured_proxy_weights"].iloc[-1].sort_values(ascending=False)
-    current_strategy_signal = results["structured_proxy_signals"].iloc[-1] if not results["structured_proxy_signals"].empty else pd.Series(dtype=object)
-    current_strategy_universe = ETF_TICKERS + [ticker for ticker in STRUCTURED_PROXY_TICKERS + CASH_PROXY_TICKERS if ticker in current_strategy_weights.index]
 else:
     current_strategy_name = "Base Rule Engine"
     current_strategy_weights = weights.sort_values(ascending=False)
@@ -355,7 +349,6 @@ current_strategy_risk = portfolio_risk_estimates(current_strategy_weights)
 current_strategy_metrics = (
     results["bond_core_overlay_metrics"] if current_strategy_name == MAIN_STRATEGY_NAME
     else results["structured_v2_metrics"] if current_strategy_name == "Structured Proxy v2 Candidate"
-    else results["structured_proxy_metrics"] if current_strategy_name == "Structured Proxy Engine"
     else results["metrics"]
 )
 current_strategy_bond_metrics = results.get("bond_core_overlay_bond_metrics", {}) if current_strategy_name == MAIN_STRATEGY_NAME else {}

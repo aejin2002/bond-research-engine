@@ -5,29 +5,14 @@ import pandas as pd
 
 from data_sources import CASH_PROXY_TICKERS, ETF_TICKERS, STRUCTURED_PROXY_TICKERS
 from risk_config import RISK_CONFIG
-from signals import ETF_META, FACTOR_WEIGHTS, recommend_weights, score_etfs
+from signals import recommend_weights, score_etfs
 
 
-STATIC_CORE = {"SHY": 0.05, "IEF": 0.30, "TLT": 0.00, "TIP": 0.10, "LQD": 0.20, "HYG": 0.10, "MBB": 0.25}
 MAIN_STRATEGY_NAME = "Risk-First Bond Signal Engine"
 DEFAULT_BOND_CORE_WEIGHT = 0.70
 DEFAULT_ACTIVE_OVERLAY_WEIGHT = 0.30
 NORMAL_CARRY_BASKET = {"JAAA": 0.50, "HYG": 0.20, "BKLN": 0.20, "CMBS": 0.10}
 BOND_REPLICA_BASE = {"SHY": 0.05, "IEF": 0.25, "TLT": 0.05, "TIP": 0.05, "LQD": 0.15, "HYG": 0.05, "MBB": 0.40}
-BOND_REPLICA_BOUNDS = {
-    "SHY": (0.00, 0.15), "IEF": (0.15, 0.35), "TLT": (0.00, 0.10),
-    "TIP": (0.00, 0.12), "LQD": (0.08, 0.22), "HYG": (0.00, 0.10),
-    "MBB": (0.30, 0.45),
-}
-HYBRID_RULES = {
-    "confirmation_days": 5,
-    "min_holding_days": 20,
-    "min_weight_gap": 0.10,
-    "max_asset_change": 0.15,
-    "annual_turnover_cap": 1.00,
-    "entry_score": 0.15,
-    "exit_score": -0.05,
-}
 
 
 def _first_valid(series: pd.Series) -> pd.Timestamp | None:
@@ -50,7 +35,7 @@ def performance_metrics(returns: pd.Series, rf: pd.Series | None = None, benchma
     result = {
         "CAGR": cagr,
         "Ann. Vol": vol,
-        "Sharpe": excess.mean() / r.std(ddof=1) * np.sqrt(12) if r.std(ddof=1) else np.nan,
+        "Sharpe": excess.mean() / excess.std(ddof=1) * np.sqrt(12) if excess.std(ddof=1) else np.nan,
         "Sortino": excess.mean() * 12 / downside if downside else np.nan,
         "Max Drawdown": drawdown.min(),
         "Calmar": cagr / abs(drawdown.min()) if drawdown.min() < 0 else np.nan,
@@ -72,146 +57,6 @@ def performance_metrics(returns: pd.Series, rf: pd.Series | None = None, benchma
                 }
             )
     return result
-
-
-def _hysteresis_target(scored: pd.DataFrame, context: dict, current: pd.Series) -> pd.Series:
-    """Require a stronger score to enter than to keep an existing ETF."""
-    adjusted = scored.copy()
-    held = current.reindex(adjusted.index, fill_value=0.0) >= .01
-    keep = held & (adjusted["Total Score"] >= HYBRID_RULES["exit_score"])
-    enter = (~held) & (adjusted["Total Score"] >= HYBRID_RULES["entry_score"])
-    eligible = keep | enter
-    adjusted.loc[~eligible, "Total Score"] = -1.0
-    adjusted.loc[keep & (adjusted["Total Score"] <= 0), "Total Score"] = .01
-    return recommend_weights(adjusted, context).reindex(ETF_TICKERS, fill_value=0.0)
-
-
-def _bounded_normalize(weights: pd.Series) -> pd.Series:
-    lower = pd.Series({ticker: BOND_REPLICA_BOUNDS[ticker][0] for ticker in ETF_TICKERS})
-    upper = pd.Series({ticker: BOND_REPLICA_BOUNDS[ticker][1] for ticker in ETF_TICKERS})
-    result = weights.reindex(ETF_TICKERS, fill_value=0.0).clip(lower=lower, upper=upper)
-    for _ in range(10):
-        residual = 1.0 - float(result.sum())
-        if abs(residual) < 1e-10:
-            break
-        room = upper - result if residual > 0 else result - lower
-        room = room.clip(lower=0.0)
-        if room.sum() <= 0:
-            break
-        result += np.sign(residual) * room * min(abs(residual) / room.sum(), 1.0)
-    return result / result.sum()
-
-
-def _duration_adjust(weights: pd.Series, target_duration: float) -> pd.Series:
-    """Move weight between existing long-only ETFs until the duration target is met."""
-    result = _bounded_normalize(weights)
-    duration = pd.Series({ticker: ETF_META[ticker][3] for ticker in ETF_TICKERS})
-    lower = pd.Series({ticker: BOND_REPLICA_BOUNDS[ticker][0] for ticker in ETF_TICKERS})
-    upper = pd.Series({ticker: BOND_REPLICA_BOUNDS[ticker][1] for ticker in ETF_TICKERS})
-    for _ in range(30):
-        gap = target_duration - float((result * duration).sum())
-        if abs(gap) < 1e-6:
-            break
-        if gap > 0:
-            donors = [ticker for ticker in ETF_TICKERS if result[ticker] > lower[ticker] + 1e-9]
-            receivers = [ticker for ticker in ETF_TICKERS if result[ticker] < upper[ticker] - 1e-9]
-            pair = max(((duration[r] - duration[d], d, r) for d in donors for r in receivers), default=(0, None, None))
-        else:
-            donors = [ticker for ticker in ETF_TICKERS if result[ticker] > lower[ticker] + 1e-9]
-            receivers = [ticker for ticker in ETF_TICKERS if result[ticker] < upper[ticker] - 1e-9]
-            pair = max(((duration[d] - duration[r], d, r) for d in donors for r in receivers), default=(0, None, None))
-        duration_change, donor, receiver = pair
-        if donor is None or duration_change <= 0:
-            break
-        amount = min(abs(gap) / duration_change, result[donor] - lower[donor], upper[receiver] - result[receiver])
-        if amount <= 1e-9:
-            break
-        result[donor] -= amount
-        result[receiver] += amount
-    return result
-
-
-def _bond_replica_target(scored: pd.DataFrame, context: dict) -> tuple[pd.Series, float]:
-    """Stable core plus small, economically constrained tactical tilts."""
-    target = pd.Series(BOND_REPLICA_BASE).reindex(ETF_TICKERS).astype(float)
-    score = scored["Total Score"].reindex(ETF_TICKERS).clip(-1.0, 1.0).fillna(0.0)
-    target += 0.025 * (score - score.mean())
-
-    regime = context["regime"]
-    duration_targets = {
-        "Goldilocks": 6.20, "Reflation": 5.80,
-        "Stagflation": 5.60, "Disinflation / Recession": 6.50,
-    }
-    duration_target = duration_targets[regime]
-    if regime == "Goldilocks":
-        target[["LQD", "HYG"]] += [0.025, 0.015]
-        target["SHY"] -= 0.040
-    elif regime == "Reflation":
-        target["TIP"] += 0.040
-        target[["IEF", "TLT"]] -= [0.025, 0.015]
-    elif regime == "Stagflation":
-        target["TIP"] += 0.050
-        target[["LQD", "HYG"]] -= [0.030, 0.020]
-    else:
-        target[["IEF", "TLT"]] += [0.035, 0.015]
-        target[["LQD", "HYG"]] -= [0.020, 0.030]
-
-    if context["risk_off"]:
-        target[["LQD", "HYG"]] -= [0.030, 0.050]
-        target[["IEF", "MBB"]] += [0.040, 0.040]
-        duration_target = 6.50
-    elif context["hy_oas"] >= 5.0 and context["hy_3m"] <= 0:
-        target[["LQD", "HYG"]] += [0.020, 0.025]
-        target["SHY"] -= 0.045
-
-    return _duration_adjust(target, duration_target), duration_target
-
-
-def run_bond_replica_backtest(
-    monthly: pd.DataFrame,
-    prices: pd.DataFrame,
-    fred: pd.DataFrame,
-    dates: pd.DatetimeIndex,
-    transaction_cost_bps: float,
-) -> dict:
-    """Quarterly core tilts plus a monthly risk transition overlay."""
-    returns: dict[pd.Timestamp, float] = {}
-    turnover: dict[pd.Timestamp, float] = {}
-    weight_rows: list[pd.Series] = []
-    duration_rows: dict[pd.Timestamp, float] = {}
-    previous = pd.Series(BOND_REPLICA_BASE).reindex(ETF_TICKERS).astype(float)
-    prior_risk_off = False
-    initialized = False
-
-    for current, following in zip(dates[:-1], dates[1:]):
-        scored, context = score_etfs(prices.loc[:current], fred.loc[:current])
-        review = (not initialized) or current.month in {3, 6, 9, 12} or bool(context["risk_off"]) != prior_risk_off
-        if review:
-            desired, _ = _bond_replica_target(scored, context)
-            step = 0.75 if bool(context["risk_off"]) != prior_risk_off else 0.50
-            proposed = previous + step * (desired - previous)
-            max_change = float((proposed - previous).abs().max())
-            if max_change > 0.05:
-                proposed = previous + (proposed - previous) * (0.05 / max_change)
-            weights = _bounded_normalize(proposed)
-        else:
-            weights = previous.copy()
-        next_returns = monthly.loc[following] / monthly.loc[current] - 1
-        one_way = float((weights - previous).abs().sum() / 2)
-        returns[following] = float((weights * next_returns).sum() - one_way * transaction_cost_bps / 10_000)
-        turnover[current] = one_way
-        weight_rows.append(weights.rename(current))
-        duration_rows[current] = float(sum(weights[ticker] * ETF_META[ticker][3] for ticker in ETF_TICKERS))
-        previous = weights
-        prior_risk_off = bool(context["risk_off"])
-        initialized = True
-
-    return {
-        "returns": pd.Series(returns, name="BOND Exposure Replica").sort_index(),
-        "weights": pd.DataFrame(weight_rows),
-        "turnover": pd.Series(turnover, name="Replica Turnover").sort_index(),
-        "duration": pd.Series(duration_rows, name="Replica Effective Duration").sort_index(),
-    }
 
 
 def _asof_value(series: pd.Series, date: pd.Timestamp, default: float = np.nan) -> float:
@@ -469,59 +314,6 @@ def _alpha_replica_target(prices: pd.DataFrame, fred: pd.DataFrame, date: pd.Tim
         "MOVE": move,
         "MOVE Percentile": move_pct,
         "Regime": context["regime"],
-    }
-    return weights, diagnostics
-
-
-def _structured_proxy_target(prices: pd.DataFrame, fred: pd.DataFrame, date: pd.Timestamp) -> tuple[pd.Series, dict]:
-    base_weights, diagnostics = _alpha_replica_target(prices, fred, date)
-    available = [ticker for ticker in STRUCTURED_PROXY_TICKERS if ticker in prices and prices[ticker].loc[:date].dropna().shape[0] > 63]
-    universe = ETF_TICKERS + available
-    weights = base_weights.reindex(universe, fill_value=0.0)
-    if not available:
-        diagnostics = {**diagnostics, "Structured Proxy Rule": "No ETF data", "Structured Proxy Weight": 0.0}
-        return weights, diagnostics
-
-    mbs_score = float(diagnostics.get("MBS RV Score", 0.0))
-    credit_score = float(diagnostics.get("Credit Cushion Score", 0.0))
-    move_pct = float(diagnostics.get("MOVE Percentile", np.nan))
-    structured_target = 0.0
-    structured_rule = "Off"
-    if mbs_score > 0 and credit_score > -1.0:
-        structured_target = 0.06 + 0.035 * min(mbs_score, 2.0)
-        structured_target += 0.020 * max(credit_score, 0.0)
-        structured_rule = "MBS gap proxy"
-    if credit_score <= -1.0 or (np.isfinite(move_pct) and move_pct >= 0.90):
-        structured_target = min(structured_target, 0.04)
-        structured_rule = "Stress cap"
-    structured_target = float(np.clip(structured_target, 0.0, 0.20))
-
-    weights = _fund_overlay(weights, structured_target, ["SHY", "IEF", "LQD", "MBB", "TIP"])
-    sleeve = pd.Series(0.0, index=available)
-    if structured_target > 0:
-        if "JAAA" in available:
-            sleeve["JAAA"] = structured_target * 0.60
-        if "CMBS" in available:
-            sleeve["CMBS"] = structured_target * 0.25
-        if "BKLN" in available and credit_score >= 0.0:
-            sleeve["BKLN"] = structured_target * 0.15
-        unassigned = structured_target - float(sleeve.sum())
-        if unassigned > 0:
-            if "JAAA" in sleeve:
-                sleeve["JAAA"] += unassigned
-            else:
-                sleeve.iloc[0] += unassigned
-    weights.loc[sleeve.index] = sleeve
-    weights = weights.clip(lower=0.0)
-    weights = weights / weights.sum() if weights.sum() else weights
-    diagnostics = {
-        **diagnostics,
-        "Structured Proxy Rule": structured_rule,
-        "Structured Proxy Weight": float(sleeve.sum()),
-        "JAAA Weight": float(weights.get("JAAA", 0.0)),
-        "BKLN Weight": float(weights.get("BKLN", 0.0)),
-        "CMBS Weight": float(weights.get("CMBS", 0.0)),
-        "Structured ETFs": ", ".join(available),
     }
     return weights, diagnostics
 
@@ -1108,8 +900,17 @@ def run_bond_core_overlay_backtest(
     if "TLT" in fallback_returns:
         core_return = core_return.where(core_asset != "TLT", fallback_returns["TLT"])
     core_return = core_return.fillna(aligned["BOND Core"])
-    core_switch_cost = (core_asset != core_asset.shift(1)).astype(float).fillna(0.0) * core_weight * transaction_cost_bps / 10_000
-    core_shift_cost = core_weight.diff().abs().fillna(0.0) * transaction_cost_bps / 10_000 + core_switch_cost
+    core_weight_prev = core_weight.shift(1)
+    core_asset_changed = core_asset.ne(core_asset.shift(1))
+    core_inception = core_weight_prev.isna()
+    # One-way turnover: full weight change when the asset identity is unchanged, but
+    # (old + new) / 2 when the core asset itself switches (e.g. BOND -> SGOV on risk-off),
+    # since that sells the old asset and buys the new one rather than just resizing a position.
+    core_turnover = (core_weight - core_weight_prev).abs().where(
+        ~core_asset_changed, (core_weight + core_weight_prev.fillna(0.0)) / 2
+    )
+    core_turnover = core_turnover.where(~core_inception, core_weight)
+    core_shift_cost = core_turnover.fillna(0.0) * transaction_cost_bps / 10_000
     combined = (
         core_weight * core_return
         + active_weight * aligned["Aggressive RA Overlay"]
@@ -1210,213 +1011,6 @@ def run_bond_core_overlay_backtest(
         "trades": trades,
         "overlay": overlay,
     }
-
-
-def run_hybrid_backtest(
-    prices: pd.DataFrame,
-    fred: pd.DataFrame,
-    common_start: pd.Timestamp,
-    transaction_cost_bps: float = 5.0,
-) -> dict:
-    """Asymmetric clock: monthly alpha, weekly momentum, daily risk-off."""
-    asset_returns = prices[ETF_TICKERS].pct_change(fill_method=None)
-    dates = asset_returns.index[(asset_returns.index >= common_start) & asset_returns.notna().all(axis=1)]
-    if len(dates) < 20:
-        return {"daily_returns": pd.Series(dtype=float), "monthly_returns": pd.Series(dtype=float),
-                "weights": pd.DataFrame(), "turnover": pd.Series(dtype=float), "trades": pd.DataFrame()}
-
-    current = pd.Series(0.0, index=ETF_TICKERS)
-    current["SHY"] = 1.0
-    last_trade_position = -10_000
-    prior_risk_off = False
-    slow_factors: pd.DataFrame | None = None
-    weekly_momentum: pd.Series | None = None
-    candidate_target = current.copy()
-    pending_signature = None
-    pending_reason = "Initial Review"
-    confirmation_count = 0
-    daily_result: dict[pd.Timestamp, float] = {}
-    turnover_rows: dict[pd.Timestamp, float] = {}
-    weight_rows: list[pd.Series] = [current.rename(dates[0])]
-    trades: list[dict] = []
-    slow_columns = ["Carry", "Value", "Real Yield", "Yield Curve", "Credit Spread", "Regime"]
-
-    for position, date in enumerate(dates):
-        day_asset_return = asset_returns.loc[date].fillna(0.0)
-        gross_return = float((current * day_asset_return).sum())
-        daily_result[date] = gross_return
-        if 1 + gross_return > 0:
-            current = current.mul(1 + day_asset_return).div(1 + gross_return)
-
-        scored, context = score_etfs(prices.loc[:date], fred.loc[:date])
-        next_date = dates[position + 1] if position + 1 < len(dates) else date + pd.Timedelta(days=7)
-        month_end = next_date.month != date.month
-        week_end = next_date.isocalendar().week != date.isocalendar().week or next_date.year != date.year
-
-        update_reason = None
-        if slow_factors is None or month_end:
-            slow_factors = scored[slow_columns].reindex(ETF_TICKERS).copy()
-            update_reason = "Monthly Alpha Review"
-        if weekly_momentum is None or week_end:
-            weekly_momentum = scored["Momentum"].reindex(ETF_TICKERS).copy()
-            update_reason = update_reason or "Weekly Momentum Review"
-
-        mixed = scored.copy().reindex(ETF_TICKERS)
-        mixed[slow_columns] = slow_factors
-        mixed["Momentum"] = weekly_momentum
-        mixed["Total Score"] = sum(mixed[factor] * weight for factor, weight in FACTOR_WEIGHTS.items())
-        if context["risk_off"]:
-            candidate_target = recommend_weights(scored, context).reindex(ETF_TICKERS, fill_value=0.0)
-        elif update_reason is not None:
-            candidate_target = _hysteresis_target(mixed, context, current)
-            pending_reason = update_reason
-
-        selected = tuple(sorted(candidate_target[candidate_target >= .01].index.tolist()))
-        signature = ("Risk Off" if context["risk_off"] else context["regime"], selected)
-        if signature == pending_signature:
-            confirmation_count += 1
-        else:
-            pending_signature = signature
-            confirmation_count = 1
-
-        weight_gap = float((candidate_target - current).abs().max())
-        held_days = position - last_trade_position
-        risk_transition = bool(context["risk_off"] and not prior_risk_off)
-        confirmed_signal = (
-            confirmation_count >= HYBRID_RULES["confirmation_days"]
-            and weight_gap >= HYBRID_RULES["min_weight_gap"]
-        )
-        can_trade = held_days >= HYBRID_RULES["min_holding_days"]
-        reason = "Risk Off" if risk_transition else pending_reason
-        should_trade = (risk_transition and weight_gap >= .05) or (can_trade and confirmed_signal)
-
-        if should_trade:
-            delta = candidate_target - current
-            max_delta = float(delta.abs().max())
-            if not risk_transition and max_delta > HYBRID_RULES["max_asset_change"]:
-                delta *= HYBRID_RULES["max_asset_change"] / max_delta
-            proposed = current + delta
-            proposed = proposed.clip(lower=0.0)
-            proposed /= proposed.sum()
-            turnover = float((proposed - current).abs().sum() / 2)
-            cutoff = date - pd.Timedelta(days=365)
-            recent_turnover = sum(value for trade_date, value in turnover_rows.items() if trade_date > cutoff)
-            remaining = max(0.0, HYBRID_RULES["annual_turnover_cap"] - recent_turnover)
-            if not risk_transition and turnover > remaining and turnover > 0:
-                scale = remaining / turnover
-                proposed = current + (proposed - current) * scale
-                proposed /= proposed.sum()
-                turnover = float((proposed - current).abs().sum() / 2)
-            if turnover > 1e-6:
-                daily_result[date] -= turnover * transaction_cost_bps / 10_000
-                turnover_rows[date] = turnover
-                current = proposed
-                last_trade_position = position
-                weight_rows.append(current.rename(date))
-                trades.append(
-                    {"Date": date, "Reason": reason, "Turnover": turnover,
-                     "Regime": signature[0], "Max Weight Gap": weight_gap,
-                     "Hold Days": held_days, "Rolling 1Y Turnover": recent_turnover + turnover}
-                )
-        prior_risk_off = bool(context["risk_off"])
-
-    daily = pd.Series(daily_result, name="Hybrid Engine").sort_index()
-    monthly = (1 + daily).resample("ME").prod() - 1
-    monthly.name = "Hybrid Engine"
-    weights = pd.DataFrame(weight_rows).groupby(level=0).last().sort_index()
-    trade_frame = pd.DataFrame(trades).set_index("Date") if trades else pd.DataFrame()
-    return {
-        "daily_returns": daily,
-        "monthly_returns": monthly,
-        "weights": weights,
-        "turnover": pd.Series(turnover_rows, name="Hybrid Turnover").sort_index(),
-        "trades": trade_frame,
-    }
-
-
-def alpha_source_attribution(
-    alpha_returns: pd.Series,
-    signals: pd.DataFrame,
-    target_returns: pd.Series | None = None,
-    benchmark_returns: pd.Series | None = None,
-) -> dict:
-    """Explain next-month alpha returns by the prior month-end source scorecard."""
-    if signals.empty or alpha_returns.dropna().empty:
-        return {"by_source": pd.DataFrame(), "score_tests": pd.DataFrame(), "monthly": pd.DataFrame()}
-
-    signal_cols = [
-        "Dominant Alpha", "MBS RV Score", "Credit Cushion Score", "Duration/MOVE Score",
-        "Curve Score", "Real Yield Score", "Cash Gate", "Risk Votes", "PIMCO Anchor Gap",
-    ]
-    available = [column for column in signal_cols if column in signals]
-    with pd.option_context("future.no_silent_downcasting", True):
-        explanatory = signals[available].reindex(alpha_returns.index).ffill().infer_objects(copy=False).shift(1)
-    frame = pd.DataFrame({"Alpha Return": alpha_returns}).join(explanatory)
-    if benchmark_returns is not None:
-        frame["AGG Return"] = benchmark_returns.reindex(frame.index)
-        frame["Active vs AGG"] = frame["Alpha Return"] - frame["AGG Return"]
-    if target_returns is not None:
-        frame["BOND Return"] = target_returns.reindex(frame.index)
-        frame["Active vs BOND"] = frame["Alpha Return"] - frame["BOND Return"]
-    frame = frame.dropna(subset=["Alpha Return", "Dominant Alpha"])
-
-    rows: list[dict] = []
-    for source, group in frame.groupby("Dominant Alpha"):
-        dominant_score_col = f"{source} Score"
-        row = {
-            "Months": len(group),
-            "Avg Dominant Score": group[dominant_score_col].mean() if dominant_score_col in group else np.nan,
-            "Avg Return": group["Alpha Return"].mean(),
-            "Cumulative Return": (1 + group["Alpha Return"]).prod() - 1,
-            "Return Hit Rate": (group["Alpha Return"] > 0).mean(),
-            "Cash Gate %": group["Cash Gate"].mean() if "Cash Gate" in group else np.nan,
-        }
-        if "Active vs AGG" in group:
-            row.update({
-                "Avg vs AGG": group["Active vs AGG"].mean(),
-                "Total vs AGG": group["Active vs AGG"].sum(),
-                "AGG Hit Rate": (group["Active vs AGG"] > 0).mean(),
-            })
-        if "Active vs BOND" in group:
-            row.update({
-                "Avg vs BOND": group["Active vs BOND"].mean(),
-                "Total vs BOND": group["Active vs BOND"].sum(),
-                "BOND Hit Rate": (group["Active vs BOND"] > 0).mean(),
-            })
-        rows.append({"Dominant Alpha": source, **row})
-    by_source = pd.DataFrame(rows).set_index("Dominant Alpha") if rows else pd.DataFrame()
-    if not by_source.empty and "Total vs AGG" in by_source:
-        by_source = by_source.sort_values("Total vs AGG", ascending=False)
-
-    score_rows: list[dict] = []
-    score_cols = ["MBS RV Score", "Credit Cushion Score", "Duration/MOVE Score", "Curve Score", "Real Yield Score"]
-    for column in [item for item in score_cols if item in frame]:
-        valid = frame[[column, "Alpha Return"] + [c for c in ["Active vs AGG", "Active vs BOND"] if c in frame]].dropna()
-        if len(valid) < 4:
-            continue
-        positive = valid[valid[column] > 0]
-        negative = valid[valid[column] < 0]
-        row = {
-            "Score": column.replace(" Score", ""),
-            "Observations": len(valid),
-            "Corr with Return": valid[column].corr(valid["Alpha Return"]),
-            "Avg Return if Positive": positive["Alpha Return"].mean() if len(positive) else np.nan,
-            "Avg Return if Negative": negative["Alpha Return"].mean() if len(negative) else np.nan,
-            "Positive Months": len(positive),
-            "Negative Months": len(negative),
-        }
-        if "Active vs AGG" in valid:
-            row["Corr with AGG Alpha"] = valid[column].corr(valid["Active vs AGG"])
-            row["Avg AGG Alpha if Positive"] = positive["Active vs AGG"].mean() if len(positive) else np.nan
-            row["Avg AGG Alpha if Negative"] = negative["Active vs AGG"].mean() if len(negative) else np.nan
-        if "Active vs BOND" in valid:
-            row["Corr with BOND Gap"] = valid[column].corr(valid["Active vs BOND"])
-            row["Avg BOND Gap if Positive"] = positive["Active vs BOND"].mean() if len(positive) else np.nan
-            row["Avg BOND Gap if Negative"] = negative["Active vs BOND"].mean() if len(negative) else np.nan
-        score_rows.append(row)
-    score_tests = pd.DataFrame(score_rows).set_index("Score") if score_rows else pd.DataFrame()
-
-    return {"by_source": by_source, "score_tests": score_tests, "monthly": frame}
 
 
 def simulate_structured_proxy_v2(
@@ -1557,10 +1151,7 @@ def run_backtest(
     common_start = dates.min()
 
     strategy_returns: dict[pd.Timestamp, float] = {}
-    static_returns: dict[pd.Timestamp, float] = {}
-    weight_rows: list[pd.Series] = []
     regime_rows: list[dict] = []
-    turnover_rows: dict[pd.Timestamp, float] = {}
     previous = pd.Series(0.0, index=ETF_TICKERS)
 
     for current, following in zip(dates[:-1], dates[1:]):
@@ -1570,8 +1161,6 @@ def run_backtest(
         turnover = float((weights - previous).abs().sum()) if previous.sum() == 0 else float((weights - previous).abs().sum() / 2)
         cost = turnover * transaction_cost_bps / 10_000
         strategy_returns[following] = float((weights * next_returns).sum() - cost)
-        static_returns[following] = float((pd.Series(STATIC_CORE) * next_returns).sum())
-        weight_rows.append(weights.rename(current))
         regime_rows.append(
             {
                 "date": current,
@@ -1581,41 +1170,23 @@ def run_backtest(
                 "Growth 6M": context["growth_6m"],
             }
         )
-        turnover_rows[current] = turnover
         previous = weights
 
     returns = pd.Series(strategy_returns, name="Rule Engine").sort_index()
-    static = pd.Series(static_returns, name="Static Core").sort_index()
     rf = fred["DGS3MO"].resample("ME").last().reindex(returns.index, method="ffill") / 100 / 12
     alpha_vol_source = "VIX or MOVE" if "MOVE" in prices and prices["MOVE"].notna().any() else "VIX"
     empty_engine = {
         "monthly_returns": pd.Series(dtype=float), "weights": pd.DataFrame(),
         "turnover": pd.Series(dtype=float), "signals": pd.DataFrame(), "trades": pd.DataFrame(),
     }
-    hybrid = {"monthly_returns": pd.Series(dtype=float), "weights": pd.DataFrame(), "turnover": pd.Series(dtype=float), "trades": pd.DataFrame()}
-    hybrid_returns = pd.Series(dtype=float, name="Hybrid Engine").reindex(returns.index)
-    replica = {"returns": pd.Series(dtype=float), "weights": pd.DataFrame(), "turnover": pd.Series(dtype=float), "duration": pd.Series(dtype=float)}
-    replica_returns = pd.Series(dtype=float, name="BOND Exposure Replica").reindex(returns.index)
-    alpha_replica = empty_engine.copy()
-    alpha_vix = empty_engine.copy()
-    alpha_move = empty_engine.copy()
-    alpha_replica_returns = alpha_replica["monthly_returns"].reindex(returns.index)
-    alpha_replica_returns.name = "Alpha Replica v2"
-    structured_available = [
-        ticker for ticker in STRUCTURED_PROXY_TICKERS
-        if ticker in prices and prices[ticker].dropna().shape[0] >= 252
-    ]
-    structured_universe = ETF_TICKERS + structured_available
-    structured_proxy = empty_engine.copy()
-    structured_returns = structured_proxy["monthly_returns"].reindex(returns.index)
-    structured_returns.name = "Structured Proxy Engine"
-    def aligned_returns(series: pd.Series | None, name: str, index: pd.Index | None = None) -> pd.Series | None:
+
+    def aligned_returns(series: pd.Series | None, name: str) -> pd.Series | None:
         if series is None or not len(series.dropna()):
             return None
         monthly_prices = series.resample("ME").last().ffill()
         if len(monthly_prices) and monthly_prices.index[-1] > series.index.max().normalize():
             monthly_prices = monthly_prices.iloc[:-1]
-        aligned = monthly_prices.pct_change().reindex(returns.index if index is None else index)
+        aligned = monthly_prices.pct_change().reindex(returns.index)
         aligned.name = name
         return aligned
 
@@ -1631,7 +1202,6 @@ def run_backtest(
     )
     bond_core_overlay_returns = bond_core_overlay["monthly_returns"].reindex(returns.index)
     bond_core_overlay_returns.name = MAIN_STRATEGY_NAME
-    alpha_attribution = {"by_source": pd.DataFrame(), "score_tests": pd.DataFrame(), "monthly": pd.DataFrame()}
     structured_v2 = simulate_structured_proxy_v2(
         prices,
         fred,
@@ -1651,7 +1221,7 @@ def run_backtest(
             "trades": pd.DataFrame(),
         }
     else:
-        structured_v2_daily = empty_engine.copy()
+        structured_v2_daily = empty_engine
     structured_v2_returns = structured_v2_daily["monthly_returns"].reindex(returns.index)
     structured_v2_returns.name = "Structured Proxy v2 Candidate"
     nav_inputs = [bond_core_overlay_returns, structured_v2_returns] + [item for item in [target_returns, benchmark_returns] if item is not None]
@@ -1659,37 +1229,18 @@ def run_backtest(
     main_target_returns = target_returns.reindex(main_strategy_index) if target_returns is not None and len(main_strategy_index) else target_returns
     main_benchmark_returns = benchmark_returns.reindex(main_strategy_index) if benchmark_returns is not None and len(main_strategy_index) else benchmark_returns
 
+    # These strategies are not executed: the code that would populate them isn't wired
+    # up (see README's "disabled" notes). Kept as explicit metadata rows so the UI can
+    # show them as documented-but-not-run rather than silently omitting them.
+    disabled_returns = pd.Series(dtype=float)
     return {
         "returns": returns,
-        "alpha_replica_returns": alpha_replica_returns,
-        "structured_proxy_returns": structured_returns,
         "structured_v2_returns": structured_v2_returns,
         "bond_core_overlay_returns": bond_core_overlay_returns,
-        "replica_returns": replica_returns,
-        "hybrid_returns": hybrid_returns,
-        "static_returns": static,
         "target_returns": target_returns,
         "benchmark_returns": benchmark_returns,
         "nav": (1 + pd.concat(nav_inputs, axis=1).dropna(how="all")).cumprod() * 100,
-        "weights": pd.DataFrame(weight_rows),
         "regimes": pd.DataFrame(regime_rows).set_index("date"),
-        "turnover": pd.Series(turnover_rows, name="Turnover"),
-        "hybrid_weights": hybrid["weights"],
-        "hybrid_turnover": hybrid["turnover"],
-        "hybrid_trades": hybrid["trades"],
-        "replica_weights": replica["weights"],
-        "replica_turnover": replica["turnover"],
-        "replica_duration": replica["duration"],
-        "alpha_replica_weights": alpha_replica["weights"],
-        "alpha_replica_turnover": alpha_replica["turnover"],
-        "alpha_replica_signals": alpha_replica["signals"],
-        "alpha_replica_trades": alpha_replica["trades"],
-        "alpha_source_attribution": alpha_attribution,
-        "structured_proxy_weights": structured_proxy["weights"],
-        "structured_proxy_turnover": structured_proxy["turnover"],
-        "structured_proxy_signals": structured_proxy["signals"],
-        "structured_proxy_trades": structured_proxy["trades"],
-        "structured_proxy_available": structured_available,
         "structured_v2_summary": structured_v2["summary"],
         "structured_v2_returns_all": structured_v2["returns"],
         "structured_v2_weights": structured_v2_daily["weights"],
@@ -1703,17 +1254,10 @@ def run_backtest(
         "bond_core_overlay_trades": bond_core_overlay["trades"],
         "bond_core_overlay_overlay": bond_core_overlay["overlay"],
         "metrics": performance_metrics(returns, rf, benchmark_returns),
-        "alpha_replica_metrics": performance_metrics(alpha_replica_returns, rf, benchmark_returns),
-        "structured_proxy_metrics": performance_metrics(structured_returns, rf, benchmark_returns),
         "structured_v2_metrics": performance_metrics(structured_v2_returns, rf, benchmark_returns),
         "bond_core_overlay_metrics": performance_metrics(bond_core_overlay_returns, rf, benchmark_returns),
         "bond_core_overlay_bond_metrics": performance_metrics(bond_core_overlay_returns, rf, target_returns),
-        "alpha_vix_metrics": performance_metrics(alpha_vix["monthly_returns"].reindex(returns.index), rf, benchmark_returns),
-        "alpha_move_metrics": performance_metrics(alpha_move["monthly_returns"].reindex(returns.index), rf, benchmark_returns),
         "alpha_vol_source": alpha_vol_source,
-        "replica_metrics": performance_metrics(replica_returns, rf, benchmark_returns),
-        "hybrid_metrics": performance_metrics(hybrid_returns, rf, benchmark_returns),
-        "static_metrics": performance_metrics(static, rf, benchmark_returns),
         "target_metrics": performance_metrics(main_target_returns, rf) if main_target_returns is not None else {},
         "benchmark_metrics": performance_metrics(main_benchmark_returns, rf) if main_benchmark_returns is not None else {},
         "strategy_metadata": {
@@ -1742,10 +1286,10 @@ def run_backtest(
                 "observed return",
                 executed=main_benchmark_returns is not None,
             ),
-            "Hybrid Engine": _strategy_metadata(hybrid_returns, "AGG", "disabled", "not executed", executed=False),
-            "BOND Exposure Replica": _strategy_metadata(replica_returns, "BOND", "disabled", "not executed", executed=False),
-            "Alpha Replica v2": _strategy_metadata(alpha_replica_returns, "AGG", "disabled", "not executed", executed=False),
-            "Structured Proxy Engine": _strategy_metadata(structured_returns, "AGG", "disabled", "not executed", executed=False),
+            "Hybrid Engine": _strategy_metadata(disabled_returns, "AGG", "disabled", "not executed", executed=False),
+            "BOND Exposure Replica": _strategy_metadata(disabled_returns, "BOND", "disabled", "not executed", executed=False),
+            "Alpha Replica v2": _strategy_metadata(disabled_returns, "AGG", "disabled", "not executed", executed=False),
+            "Structured Proxy Engine": _strategy_metadata(disabled_returns, "AGG", "disabled", "not executed", executed=False),
         },
         "common_start": common_start,
         "main_strategy_start": main_strategy_index.min() if len(main_strategy_index) else common_start,
@@ -1772,72 +1316,3 @@ def infer_long_only_exposures(prices: pd.DataFrame, comparator: pd.Series, windo
     return pd.DataFrame(rows)
 
 
-FACTOR_COMBINATIONS = {
-    "Equal Factor": {"Carry": .125, "Momentum": .125, "Value": .125, "Real Yield": .125, "Yield Curve": .125, "Credit Spread": .125, "Defensive": .125, "Regime": .125},
-    "Carry + Momentum": {"Carry": .35, "Momentum": .35, "Defensive": .15, "Regime": .15},
-    "Valuation + Curve": {"Value": .30, "Real Yield": .20, "Yield Curve": .25, "Credit Spread": .15, "Defensive": .10},
-    "Credit + Defensive": {"Carry": .15, "Credit Spread": .30, "Defensive": .30, "Regime": .15, "Momentum": .10},
-    "Macro Regime": {"Yield Curve": .25, "Real Yield": .15, "Defensive": .25, "Regime": .35},
-    "PIMCO Core Proxy": {"Carry": .20, "Value": .10, "Yield Curve": .20, "Credit Spread": .20, "Defensive": .15, "Regime": .15},
-}
-
-
-def simulate_rule_combinations(
-    prices: pd.DataFrame,
-    fred: pd.DataFrame,
-    target: pd.Series,
-    common_start: pd.Timestamp,
-    transaction_cost_bps: float = 5.0,
-) -> dict:
-    monthly = prices[ETF_TICKERS].resample("ME").last().ffill()
-    if monthly.index[-1] > prices.index.max().normalize():
-        monthly = monthly.iloc[:-1]
-    dates = monthly.index[monthly.index >= common_start]
-    target_monthly = target.resample("ME").last().ffill()
-    if target_monthly.index[-1] > target.index.max().normalize():
-        target_monthly = target_monthly.iloc[:-1]
-    target_returns = target_monthly.pct_change().reindex(dates[1:])
-    rf = fred["DGS3MO"].resample("ME").last().reindex(dates[1:], method="ffill") / 100 / 12
-
-    config_returns = {name: {} for name in FACTOR_COMBINATIONS}
-    config_turnover = {name: {} for name in FACTOR_COMBINATIONS}
-    config_weights = {name: {} for name in FACTOR_COMBINATIONS}
-    previous = {name: pd.Series(0.0, index=ETF_TICKERS) for name in FACTOR_COMBINATIONS}
-
-    for current, following in zip(dates[:-1], dates[1:]):
-        scored, context = score_etfs(prices.loc[:current], fred.loc[:current])
-        next_returns = monthly.loc[following] / monthly.loc[current] - 1
-        for name, mix in FACTOR_COMBINATIONS.items():
-            variant = scored.copy()
-            variant["Total Score"] = sum(variant[factor] * weight for factor, weight in mix.items())
-            weights = recommend_weights(variant, context).reindex(ETF_TICKERS, fill_value=0.0)
-            prior = previous[name]
-            turnover = float((weights - prior).abs().sum()) if prior.sum() == 0 else float((weights - prior).abs().sum() / 2)
-            config_returns[name][following] = float((weights * next_returns).sum() - turnover * transaction_cost_bps / 10_000)
-            config_turnover[name][current] = turnover
-            config_weights[name][current] = weights
-            previous[name] = weights
-
-    return_frame = pd.DataFrame({name: pd.Series(values) for name, values in config_returns.items()}).sort_index()
-    target_metrics = performance_metrics(target_returns, rf)
-    rows = []
-    for name in FACTOR_COMBINATIONS:
-        series = return_frame[name]
-        metrics = performance_metrics(series, rf, target_returns)
-        aligned = pd.concat([series, target_returns], axis=1).dropna()
-        rmse = float(np.sqrt(np.mean((aligned.iloc[:, 0] - aligned.iloc[:, 1]) ** 2)) * np.sqrt(12))
-        annual_turnover = float(pd.Series(config_turnover[name]).mean() * 12)
-        loss = (
-            .35 * rmse
-            + .20 * abs(metrics.get("Ann. Vol", 0) - target_metrics.get("Ann. Vol", 0))
-            + .20 * abs(metrics.get("Max Drawdown", 0) - target_metrics.get("Max Drawdown", 0))
-            + .15 * abs(metrics.get("Beta", 0) - 1) * .05
-            + .10 * annual_turnover * transaction_cost_bps / 10_000
-        )
-        rows.append({"Combination": name, **metrics, "RMSE": rmse, "Ann. Turnover": annual_turnover, "Replication Loss": loss})
-    summary = pd.DataFrame(rows).set_index("Combination").sort_values("Replication Loss")
-    weight_frames = {
-        name: pd.DataFrame.from_dict(rows, orient="index").reindex(columns=ETF_TICKERS, fill_value=0.0).sort_index()
-        for name, rows in config_weights.items()
-    }
-    return {"summary": summary, "returns": return_frame, "target_returns": target_returns, "weights": weight_frames}
