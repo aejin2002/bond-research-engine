@@ -11,8 +11,6 @@ class RiskConfig:
     crisis_votes: int = 3
     minimum_hold_days: int = 20
     exit_clear_days: int = 5
-    warning_exposure: float = 0.50
-    crisis_exposure: float = 0.00
 
     hy_spread_3m_warning: float = 0.75
     hy_spread_3m_crisis: float = 1.00

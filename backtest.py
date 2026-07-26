@@ -455,9 +455,19 @@ def _dynamic_bond_core_weight(
     structured = float(sum(overlay_weights.get(ticker, 0.0) for ticker in STRUCTURED_PROXY_TICKERS))
     carry = float(overlay_weights.get("HYG", 0.0) + overlay_weights.get("BKLN", 0.0) + overlay_weights.get("JAAA", 0.0))
 
-    if len(risk_flags) >= 3 or context["risk_off"] or context["hy_3m"] >= 1.00 or nfci >= 0.50:
+    if (
+        len(risk_flags) >= RISK_CONFIG.crisis_votes
+        or context["risk_off"]
+        or context["hy_3m"] >= RISK_CONFIG.hy_spread_3m_crisis
+        or nfci >= RISK_CONFIG.nfci_crisis
+    ):
         return 1.00, "Risk-off: defensive core 100 / Overlay 0"
-    if len(risk_flags) >= 2 or context["hy_3m"] >= 0.70 or (np.isfinite(move_pct) and move_pct >= 0.88) or nfci >= 0.20:
+    if (
+        len(risk_flags) >= RISK_CONFIG.entry_votes
+        or context["hy_3m"] >= 0.70
+        or (np.isfinite(move_pct) and move_pct >= 0.88)
+        or nfci >= RISK_CONFIG.nfci_warning
+    ):
         return 0.90, "Risk warning: defensive core 90 / Overlay 10"
     if context["hy_3m"] >= 0.35 or (np.isfinite(move_pct) and move_pct >= 0.82) or nfci >= 0.10:
         return 0.80, "Early warning: defensive core 80 / Overlay 20"
@@ -501,7 +511,7 @@ def _aggressive_ra_overlay_target(prices: pd.DataFrame, fred: pd.DataFrame, date
     risk_flags = []
     if context["risk_off"]:
         risk_flags.append("regime risk-off")
-    if nfci >= 0.20:
+    if nfci >= RISK_CONFIG.nfci_warning:
         risk_flags.append("NFCI")
     if context["hy_3m"] >= 0.70:
         risk_flags.append("HY spread")
@@ -510,7 +520,7 @@ def _aggressive_ra_overlay_target(prices: pd.DataFrame, fred: pd.DataFrame, date
     if hyg_1m <= -0.025:
         risk_flags.append("credit price")
 
-    if len(risk_flags) >= 3:
+    if len(risk_flags) >= RISK_CONFIG.crisis_votes:
         weights[cash_asset] = 0.75
         weights["IEF"] = 0.25
         overlay_rule = "Defensive cash/short-duration"
@@ -831,15 +841,15 @@ def run_bond_core_overlay_backtest(
             if cash_gate:
                 return cash_asset, f"Cash gate active: 100% defensive {cash_asset}", 1.00, "Cooldown / cash gate", cash_asset
             rate_shock = (
-                np.isfinite(move_pct) and move_pct >= 0.85
+                np.isfinite(move_pct) and move_pct >= RISK_CONFIG.move_percentile_warning
                 and (
                     duration_score <= -0.5
                     or (np.isfinite(ten_year_3m) and ten_year_3m >= 0.15)
                 )
             )
-            severe_credit = risk_votes >= 2 or hy_3m >= 0.90 or nfci >= 0.35
+            severe_credit = risk_votes >= RISK_CONFIG.entry_votes or hy_3m >= 0.90 or nfci >= 0.35
             flight_to_quality = (
-                (risk_votes >= 1 or (np.isfinite(vix_pct) and vix_pct >= 0.85) or hy_3m >= 0.45 or unrate_gap >= 0.50)
+                (risk_votes >= 1 or (np.isfinite(vix_pct) and vix_pct >= 0.85) or hy_3m >= 0.45 or unrate_gap >= RISK_CONFIG.unemployment_gap_warning)
                 and np.isfinite(ten_year_3m) and ten_year_3m <= -0.15
                 and duration_score >= 0.5
             )
@@ -851,9 +861,9 @@ def run_bond_core_overlay_backtest(
                 or (np.isfinite(move_pct) and move_pct >= 0.82 and duration_score < 0)
             )
             recession_duration = (
-                (regime == "Disinflation / Recession" or unrate_gap >= 0.50)
+                (regime == "Disinflation / Recession" or unrate_gap >= RISK_CONFIG.unemployment_gap_warning)
                 and duration_score >= 0.75
-                and (not np.isfinite(move_pct) or move_pct < 0.85)
+                and (not np.isfinite(move_pct) or move_pct < RISK_CONFIG.move_percentile_warning)
             )
             if rate_shock:
                 return cash_asset, f"Rate/MOVE shock: 100% defensive core to {cash_asset}", 1.00, "Rate / inflation shock", cash_asset
