@@ -11,8 +11,6 @@ class RiskConfig:
     crisis_votes: int = 3
     minimum_hold_days: int = 20
     exit_clear_days: int = 5
-    warning_exposure: float = 0.50
-    crisis_exposure: float = 0.00
 
     hy_spread_3m_warning: float = 0.75
     hy_spread_3m_crisis: float = 1.00
@@ -34,7 +32,11 @@ RISK_CONFIG = RiskConfig()
 
 def risk_config_summary(config: RiskConfig = RISK_CONFIG) -> str:
     return (
-        f"Risk gate uses independent pillars; warning starts at {config.entry_votes}+ pillars, "
-        f"crisis at {config.crisis_votes}+ pillars. Cash gate holds at least "
-        f"{config.minimum_hold_days} trading days and requires {config.exit_clear_days} clear days."
+        f"Full defensive (cash) gate triggers when {config.entry_votes}+ of the 5 independent pillars "
+        f"(Credit, Rates, Liquidity, Labor, Equity Vol) are active, or when a separate credit/liquidity "
+        f"override (HY spread blowout, NFCI stress, or a MOVE-percentile + rate-shock combo) is met on its "
+        f"own. Cash gate holds at least {config.minimum_hold_days} trading days and requires "
+        f"{config.exit_clear_days} clear days before re-entering. Note: crisis_votes={config.crisis_votes} "
+        f"is defined in RiskConfig but is not read by this gate — it drives a separate BOND-core-weight "
+        f"escalation tier instead."
     )
