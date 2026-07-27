@@ -703,7 +703,7 @@ with tabs[2]:
 
 with tabs[3]:
     st.markdown("## Rule Library")
-    st.caption("각 Rule은 같은 15개 질문을 통과해야 의사결정 엔진에 들어갑니다.")
+    st.caption("각 Rule은 동일한 15개 연구 항목으로 문서화된다.")
     selected_rule = st.selectbox("Rule 선택", [item["Rule"] for item in RULES])
     item = next(entry for entry in RULES if entry["Rule"] == selected_rule)
     for number, field in enumerate(RULE_FIELDS, 1):
