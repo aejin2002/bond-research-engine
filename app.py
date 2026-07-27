@@ -330,7 +330,31 @@ except Exception as exc:
 
 regime_name = "Risk Off" if ctx["risk_off"] else ctx["regime"]
 latest_date = fred.dropna(how="all").index.max().date().isoformat()
-if not results["bond_core_overlay_effective_weights"].empty:
+
+# --- Defensive access to the daily-state result keys ------------------------
+# These keys were added to run_backtest() together with this UI. If this
+# script is ever re-executed against an older, already-imported backtest
+# module (e.g. a hot-reload on Streamlit Cloud that re-runs app.py without
+# restarting Python, so sys.modules still holds the previous backtest), the
+# keys will be absent. Read them with .get() and fall back to the legacy
+# month-end keys so the app degrades with a warning instead of a KeyError.
+overlay_effective_weights = results.get("bond_core_overlay_effective_weights", pd.DataFrame())
+overlay_daily_state = results.get("bond_core_overlay_daily_state", pd.DataFrame())
+overlay_monthly_signals = results.get(
+    "bond_core_overlay_monthly_signals", results.get("bond_core_overlay_signals", pd.DataFrame())
+)
+overlay_trade_log = results.get(
+    "bond_core_overlay_trade_log", results.get("bond_core_overlay_trades", pd.DataFrame())
+)
+daily_allocation_fallback = False
+if overlay_effective_weights.empty and not results.get("bond_core_overlay_weights", pd.DataFrame()).empty:
+    daily_allocation_fallback = True
+    overlay_effective_weights = results.get("bond_core_overlay_weights", pd.DataFrame())
+    overlay_daily_state = pd.DataFrame()
+if daily_allocation_fallback:
+    st.warning("일별 allocation 데이터가 없어 기존 월말 allocation을 표시합니다")
+
+if not overlay_effective_weights.empty:
     current_strategy_name = MAIN_STRATEGY_NAME
     # Current Allocation / Allocation History are driven by the daily state
     # machine (effective_weights/daily_state), never by bond_core_overlay_signals
@@ -339,23 +363,23 @@ if not results["bond_core_overlay_effective_weights"].empty:
     # allocation" was built by ffilling the month-end snapshot across the
     # whole month, which could show a stale (pre-crisis) allocation for up to
     # ~3 weeks after an intra-month Severe Risk → Cash entry.
-    current_strategy_weights = results["bond_core_overlay_effective_weights"].iloc[-1].sort_values(ascending=False)
+    current_strategy_weights = overlay_effective_weights.iloc[-1].sort_values(ascending=False)
     current_strategy_daily_state = (
-        results["bond_core_overlay_daily_state"].iloc[-1]
-        if not results["bond_core_overlay_daily_state"].empty else pd.Series(dtype=object)
+        overlay_daily_state.iloc[-1]
+        if not overlay_daily_state.empty else pd.Series(dtype=object)
     )
-    current_strategy_signal = results["bond_core_overlay_monthly_signals"].iloc[-1] if not results["bond_core_overlay_monthly_signals"].empty else pd.Series(dtype=object)
-    latest_allocation_date = results["bond_core_overlay_effective_weights"].index[-1]
+    current_strategy_signal = overlay_monthly_signals.iloc[-1] if not overlay_monthly_signals.empty else pd.Series(dtype=object)
+    latest_allocation_date = overlay_effective_weights.index[-1]
     latest_signal_date = (
-        results["bond_core_overlay_monthly_signals"].index[-1]
-        if not results["bond_core_overlay_monthly_signals"].empty else None
+        overlay_monthly_signals.index[-1]
+        if not overlay_monthly_signals.empty else None
     )
     current_strategy_universe = ["BOND"] + ETF_TICKERS + [ticker for ticker in STRUCTURED_PROXY_TICKERS + CASH_PROXY_TICKERS if ticker in current_strategy_weights.index]
 
     # Last date the model allocation itself actually changed (row-to-row diff),
     # and the weights immediately before/after that change -- for the
     # "Why this allocation?" explanation block below.
-    _ew_history = results["bond_core_overlay_effective_weights"]
+    _ew_history = overlay_effective_weights
     if len(_ew_history) >= 2:
         _row_change = _ew_history.diff().abs().sum(axis=1)
         _changed_dates = _ew_history.index[_row_change > 1e-9]
@@ -436,7 +460,7 @@ with tabs[0]:
     k3.metric("CAGR since 2023-07", f"{recovery_metrics.get('CAGR', np.nan):.2%}")
     st.caption("2020-10 이후 성과는 JAAA 상장 이후 공통기간입니다. 2023-07 이후 숫자는 최근 회복장만 자른 참고값입니다.")
 
-    if current_strategy_name == MAIN_STRATEGY_NAME:
+    if current_strategy_name == MAIN_STRATEGY_NAME and not daily_allocation_fallback:
         st.markdown("#### Why this allocation?")
         st.warning(
             "현재 배분은 일별 모델 상태를 나타내며, 성과 백테스트는 기존 월별 리밸런싱 가정으로 계산됩니다."
@@ -753,9 +777,12 @@ with tabs[2]:
     a, b = st.columns(2)
     with a:
         st.subheader("Main Strategy Allocation History")
-        st.caption("일별 current model allocation입니다 — 월말 신호를 ffill한 값이 아니라, 그날그날의 모델 상태를 그대로 반영합니다.")
-        if not results["bond_core_overlay_effective_weights"].empty:
-            weight_long = results["bond_core_overlay_effective_weights"].reset_index().rename(columns={"index":"Date"}).melt("Date", var_name="ETF", value_name="Weight")
+        if daily_allocation_fallback:
+            st.caption("일별 allocation 데이터가 없어 기존 월말 allocation을 표시합니다.")
+        else:
+            st.caption("일별 current model allocation입니다 — 월말 신호를 ffill한 값이 아니라, 그날그날의 모델 상태를 그대로 반영합니다.")
+        if not overlay_effective_weights.empty:
+            weight_long = overlay_effective_weights.reset_index().rename(columns={"index":"Date"}).melt("Date", var_name="ETF", value_name="Weight")
             area = alt.Chart(weight_long).mark_area().encode(
                 x=alt.X("Date:T", title=None),
                 y=alt.Y("Weight:Q", stack="normalize", axis=alt.Axis(format="%")),
@@ -775,8 +802,8 @@ with tabs[2]:
         "일별 모델 상태(Cash Gate/State/진입일/Hold·Clear 경과)와 그날의 current model allocation을 합친 표입니다. "
         "다운로드 아이콘으로 별도 CSV 내보내기가 가능합니다 (아래 Monthly Signal Snapshots, Trade Log와는 분리된 파일입니다)."
     )
-    daily_state_table = results["bond_core_overlay_daily_state"]
-    daily_weights_table = results["bond_core_overlay_effective_weights"]
+    daily_state_table = overlay_daily_state
+    daily_weights_table = overlay_effective_weights
     if daily_state_table.empty:
         st.info(f"{MAIN_STRATEGY_NAME} 일별 상태 데이터가 없습니다.")
     else:
@@ -803,8 +830,8 @@ with tabs[2]:
     st.subheader("Monthly Signal Snapshots")
     st.caption("월말에만 재계산되는 진단 스냅샷입니다 (target_func 스코어카드 등). 현재 배분(Current Strategy Allocation/Daily Allocation State)에는 쓰이지 않습니다.")
     source_cols = ["MBS RV Score", "Credit Cushion Score", "Duration/MOVE Score", "Curve Score", "Real Yield Score", "Overlay Structured"]
-    if all(column in results["bond_core_overlay_monthly_signals"] for column in source_cols):
-        line_chart(results["bond_core_overlay_monthly_signals"][source_cols].tail(36), "Score / Weight", 260)
+    if all(column in overlay_monthly_signals for column in source_cols):
+        line_chart(overlay_monthly_signals[source_cols].tail(36), "Score / Weight", 260)
     signal_cols = [
         "Regime", "Dominant Alpha", "Crisis Type", "Hedge ETF", "Core Allocation Rule", "Core Defense Asset", "Core Defense Rule", "Overlay Rule", "Overlay Risk", "BOND Core Weight", "Active Overlay Weight",
         "Return Mode", "Carry Basket Weight", "Carry Basket Assets",
@@ -813,8 +840,8 @@ with tabs[2]:
         "MOVE Percentile", "VIX Percentile", "NFCI", "HY OAS 3M", "10Y 3M Change",
         "JAAA vs SHY 1M", "BKLN vs SHY 1M", "CMBS vs MBB 3M", "Risk Votes", "Risk Pillars", "Triggered", "Cash Gate",
     ]
-    signal_cols = [col for col in signal_cols if col in results["bond_core_overlay_monthly_signals"]]
-    main_signals = results["bond_core_overlay_monthly_signals"][signal_cols].tail(24).sort_index(ascending=False)
+    signal_cols = [col for col in signal_cols if col in overlay_monthly_signals]
+    main_signals = overlay_monthly_signals[signal_cols].tail(24).sort_index(ascending=False)
     st.dataframe(
         main_signals.style.format({
             "BOND Core Weight":"{:.0%}", "Active Overlay Weight":"{:.0%}",
@@ -830,10 +857,10 @@ with tabs[2]:
         width="stretch",
     )
     st.subheader("Main Strategy Trade Log")
-    if results["bond_core_overlay_trade_log"].empty:
+    if overlay_trade_log.empty:
         st.info(f"{MAIN_STRATEGY_NAME} 거래가 없습니다.")
     else:
-        trade_log = results["bond_core_overlay_trade_log"].tail(30).sort_index(ascending=False)
+        trade_log = overlay_trade_log.tail(30).sort_index(ascending=False)
         st.dataframe(trade_log.style.format({"Turnover":"{:.1%}", "HY OAS 3M":"{:+.2f}", "MOVE":"{:.1f}", "MOVE Percentile":"{:.0%}", "VIX Percentile":"{:.0%}", "HYG vs SHY 1M":"{:+.1%}", "Risk Votes":"{:.0f}"}), width="stretch")
     with st.expander("Structured Proxy v2 candidate grid"):
         if not results["structured_v2_summary"].empty:
@@ -903,7 +930,7 @@ with tabs[4]:
             p3.metric("Gross / Net", f"{latest_exposure['Gross / Net']:.2f}x")
             p4.metric("공시 포지션", f"{latest_exposure['Number of Positions']:,.0f}개")
 
-            aligned_positions, position_metrics = position_alignment(results["bond_core_overlay_effective_weights"], bond_exposures)
+            aligned_positions, position_metrics = position_alignment(overlay_effective_weights, bond_exposures)
             if position_metrics:
                 a1, a2, a3 = st.columns(3)
                 a1.metric("포지션 변화 방향 일치율", f"{position_metrics['Direction Match']:.0%}")
@@ -936,8 +963,8 @@ with tabs[4]:
             line_chart(quality, "Share of funded holdings", 260)
             st.caption("N-PORT에는 신용등급 필드가 없어 Government+Agency MBS를 High Quality, Non-Agency MBS+ABS/CLO+Credit/Loans를 Spread Risk 프록시로 사용합니다. 실제 평균 신용등급으로 해석하면 안 됩니다.")
 
-            mbs_gap_weights = results["bond_core_overlay_effective_weights"]
-            mbs_gap_signals = results["bond_core_overlay_monthly_signals"]
+            mbs_gap_weights = overlay_effective_weights
+            mbs_gap_signals = overlay_monthly_signals
             mbs_gap, mbs_gap_metrics = mbs_gap_diagnostic(mbs_gap_weights, bond_exposures, mbs_gap_signals)
             if not mbs_gap.empty:
                 st.markdown("### MBS RV Gap Diagnostic")
