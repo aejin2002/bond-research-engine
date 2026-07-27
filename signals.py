@@ -5,6 +5,17 @@ import pandas as pd
 
 from data_sources import ETF_TICKERS
 from risk_config import RISK_CONFIG
+from signal_config import (
+    CARRY,
+    CREDIT_SPREAD,
+    DEFENSIVE,
+    MOMENTUM,
+    REAL_YIELD,
+    REGIME_OVERLAY,
+    REGIME_PREFERENCES,
+    VALUE,
+    YIELD_CURVE,
+)
 
 
 ETF_META = {
@@ -18,14 +29,14 @@ ETF_META = {
 }
 
 FACTOR_WEIGHTS = {
-    "Carry": 0.20,
-    "Momentum": 0.20,
-    "Value": 0.15,
-    "Real Yield": 0.10,
-    "Yield Curve": 0.10,
-    "Credit Spread": 0.10,
-    "Defensive": 0.05,
-    "Regime": 0.10,
+    "Carry": CARRY.weight,
+    "Momentum": MOMENTUM.weight,
+    "Value": VALUE.weight,
+    "Real Yield": REAL_YIELD.weight,
+    "Yield Curve": YIELD_CURVE.weight,
+    "Credit Spread": CREDIT_SPREAD.weight,
+    "Defensive": DEFENSIVE.weight,
+    "Regime": REGIME_OVERLAY.weight,
 }
 
 CAPS = {"SHY": 1.0, "IEF": 0.40, "TLT": 0.25, "TIP": 0.30,
@@ -77,9 +88,9 @@ def regime_snapshot(fred: pd.DataFrame) -> dict:
     growth_series = (ip / ip.shift(6)) ** 2 - 1
     growth_6m = float(growth_series.iloc[-1]) if len(growth_series.dropna()) else np.nan
     growth_recent = growth_series.tail(3).mean()
-    growth_rising = growth_recent > 0.0
+    growth_rising = growth_recent > REGIME_OVERLAY.thresholds["growth"]
     inflation_3m_series = (core / core.shift(3)) ** 4 - 1
-    inflation_rising = inflation_3m_series.tail(3).mean() > 0.03
+    inflation_rising = inflation_3m_series.tail(3).mean() > REGIME_OVERLAY.thresholds["inflation"]
     if growth_rising and not inflation_rising:
         regime = "Goldilocks"
     elif growth_rising and inflation_rising:
@@ -103,8 +114,8 @@ def regime_snapshot(fred: pd.DataFrame) -> dict:
 def score_etfs(prices: pd.DataFrame, fred: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     market = build_market_series(fred)
     regime = regime_snapshot(fred)
-    shy_6 = _return_at(prices, "SHY", 6)
-    shy_12 = _return_at(prices, "SHY", 12)
+    shy_6 = _return_at(prices, "SHY", MOMENTUM.thresholds["lookback_short_m"])
+    shy_12 = _return_at(prices, "SHY", MOMENTUM.thresholds["lookback_long_m"])
     slope = _latest(market["T10Y2Y"])
     real_yield = _latest(market["DFII10"])
     ig_oas = _latest(market["BAMLC0A0CM"])
@@ -126,7 +137,8 @@ def score_etfs(prices: pd.DataFrame, fred: pd.DataFrame) -> tuple[pd.DataFrame, 
         if ticker not in prices:
             continue
         label, role, yield_key, duration = ETF_META[ticker]
-        r6, r12 = _return_at(prices, ticker, 6), _return_at(prices, ticker, 12)
+        r6 = _return_at(prices, ticker, MOMENTUM.thresholds["lookback_short_m"])
+        r12 = _return_at(prices, ticker, MOMENTUM.thresholds["lookback_long_m"])
         ex6, ex12 = r6 - shy_6, r12 - shy_12
         momentum = 1 if ex6 > 0 and ex12 > 0 else (-1 if ex6 < 0 and ex12 < 0 else 0)
         yld_series = market[yield_key].dropna()
@@ -134,28 +146,39 @@ def score_etfs(prices: pd.DataFrame, fred: pd.DataFrame) -> tuple[pd.DataFrame, 
         shy_yield = _latest(market["DGS2"])
         vol = float(vols.get(ticker, np.nan))
         carry_edge = yld - shy_yield
-        carry = 1 if carry_edge >= 0.75 and momentum >= 0 else (-1 if carry_edge < 0.25 else 0)
-        ypct = _percentile(yld_series, 5)
+        carry = 1 if carry_edge >= CARRY.thresholds["positive"] and momentum >= 0 else (-1 if carry_edge < CARRY.thresholds["negative"] else 0)
+        ypct = _percentile(yld_series, VALUE.thresholds["lookback_years"])
         inflation_ok = not regime["inflation_rising"]
-        value = 1 if ypct >= 0.80 and momentum >= 0 and inflation_ok else (-1 if ypct <= 0.20 else 0)
+        value = 1 if ypct >= VALUE.thresholds["positive_pct"] and momentum >= 0 and inflation_ok else (-1 if ypct <= VALUE.thresholds["negative_pct"] else 0)
 
         real = 0
         if ticker == "TIP":
-            real = 1 if real_yield >= 2.0 and momentum >= 0 else (-1 if real_yield < 0 else 0)
+            real = 1 if real_yield >= REAL_YIELD.thresholds["positive"] and momentum >= 0 else (-1 if real_yield < REAL_YIELD.thresholds["negative"] else 0)
 
         curve = 0
-        if slope > 0.75 and ticker == "IEF":
+        if slope > YIELD_CURVE.thresholds["steep"] and ticker == "IEF":
             curve = 1
-        if slope < -0.25 and inflation_ok and regime["unrate_delta"] >= 0.3 and ticker in {"IEF", "TLT"}:
+        if (
+            slope < YIELD_CURVE.thresholds["inverted"]
+            and inflation_ok
+            and regime["unrate_delta"] >= YIELD_CURVE.thresholds["unrate_gap"]
+            and ticker in {"IEF", "TLT"}
+        ):
             curve = 1 if momentum >= 0 else 0
-        if slope < -0.25 and ticker == "SHY":
+        if slope < YIELD_CURVE.thresholds["inverted"] and ticker == "SHY":
             curve = -1
 
         credit = 0
         if ticker == "LQD":
-            credit = -1 if ig_oas < 0.90 else (1 if ig_oas > 1.50 and momentum >= 0 else 0)
+            credit = (
+                -1 if ig_oas < CREDIT_SPREAD.thresholds["lqd_negative"]
+                else (1 if ig_oas > CREDIT_SPREAD.thresholds["lqd_positive"] and momentum >= 0 else 0)
+            )
         if ticker == "HYG":
-            credit = -1 if hy_oas < 3.00 or hy_3m >= 1.00 else (1 if hy_oas > 5.00 and hy_3m <= 0 and momentum > 0 else 0)
+            credit = (
+                -1 if hy_oas < CREDIT_SPREAD.thresholds["hyg_negative"] or hy_3m >= CREDIT_SPREAD.thresholds["hyg_negative_3m_change"]
+                else (1 if hy_oas > CREDIT_SPREAD.thresholds["hyg_positive"] and hy_3m <= 0 and momentum > 0 else 0)
+            )
 
         defensive = 0
         if risk_off:
@@ -164,18 +187,8 @@ def score_etfs(prices: pd.DataFrame, fred: pd.DataFrame) -> tuple[pd.DataFrame, 
                 defensive = 1
 
         reg_score = 0
-        pref = {
-            "Goldilocks": {"LQD", "HYG", "MBB", "IEF"},
-            "Reflation": {"TIP", "SHY", "HYG"},
-            "Stagflation": {"TIP", "SHY"},
-            "Disinflation / Recession": {"IEF", "TLT", "SHY"},
-        }[regime["regime"]]
-        avoid = {
-            "Goldilocks": {"TLT"},
-            "Reflation": {"TLT", "LQD"},
-            "Stagflation": {"TLT", "HYG", "LQD"},
-            "Disinflation / Recession": {"HYG"},
-        }[regime["regime"]]
+        pref = REGIME_PREFERENCES[regime["regime"]]["prefer"]
+        avoid = REGIME_PREFERENCES[regime["regime"]]["avoid"]
         reg_score = 1 if ticker in pref else (-1 if ticker in avoid else 0)
 
         factors = {"Carry": carry, "Momentum": momentum, "Value": value, "Real Yield": real,
