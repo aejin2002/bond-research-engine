@@ -330,20 +330,58 @@ except Exception as exc:
 
 regime_name = "Risk Off" if ctx["risk_off"] else ctx["regime"]
 latest_date = fred.dropna(how="all").index.max().date().isoformat()
-if not results["bond_core_overlay_weights"].empty:
+if not results["bond_core_overlay_effective_weights"].empty:
     current_strategy_name = MAIN_STRATEGY_NAME
-    current_strategy_weights = results["bond_core_overlay_weights"].iloc[-1].sort_values(ascending=False)
-    current_strategy_signal = results["bond_core_overlay_signals"].iloc[-1] if not results["bond_core_overlay_signals"].empty else pd.Series(dtype=object)
+    # Current Allocation / Allocation History are driven by the daily state
+    # machine (effective_weights/daily_state), never by bond_core_overlay_signals
+    # (that stays a separate, month-end-only diagnostic snapshot -- see
+    # "Main Strategy Signals" below). This is the fix: previously "current
+    # allocation" was built by ffilling the month-end snapshot across the
+    # whole month, which could show a stale (pre-crisis) allocation for up to
+    # ~3 weeks after an intra-month Severe Risk → Cash entry.
+    current_strategy_weights = results["bond_core_overlay_effective_weights"].iloc[-1].sort_values(ascending=False)
+    current_strategy_daily_state = (
+        results["bond_core_overlay_daily_state"].iloc[-1]
+        if not results["bond_core_overlay_daily_state"].empty else pd.Series(dtype=object)
+    )
+    current_strategy_signal = results["bond_core_overlay_monthly_signals"].iloc[-1] if not results["bond_core_overlay_monthly_signals"].empty else pd.Series(dtype=object)
+    latest_allocation_date = results["bond_core_overlay_effective_weights"].index[-1]
+    latest_signal_date = (
+        results["bond_core_overlay_monthly_signals"].index[-1]
+        if not results["bond_core_overlay_monthly_signals"].empty else None
+    )
     current_strategy_universe = ["BOND"] + ETF_TICKERS + [ticker for ticker in STRUCTURED_PROXY_TICKERS + CASH_PROXY_TICKERS if ticker in current_strategy_weights.index]
+
+    # Last date the model allocation itself actually changed (row-to-row diff),
+    # and the weights immediately before/after that change -- for the
+    # "Why this allocation?" explanation block below.
+    _ew_history = results["bond_core_overlay_effective_weights"]
+    if len(_ew_history) >= 2:
+        _row_change = _ew_history.diff().abs().sum(axis=1)
+        _changed_dates = _ew_history.index[_row_change > 1e-9]
+        last_allocation_change_date = _changed_dates[-1] if len(_changed_dates) else _ew_history.index[0]
+        _change_pos = _ew_history.index.get_loc(last_allocation_change_date)
+        weights_before_change = _ew_history.iloc[_change_pos - 1] if _change_pos > 0 else _ew_history.iloc[_change_pos]
+        weights_after_change = _ew_history.iloc[_change_pos]
+    else:
+        last_allocation_change_date = latest_allocation_date
+        weights_before_change = current_strategy_weights
+        weights_after_change = current_strategy_weights
 elif not results["structured_v2_weights"].empty:
     current_strategy_name = "Structured Proxy v2 Candidate"
     current_strategy_weights = results["structured_v2_weights"].iloc[-1].sort_values(ascending=False)
+    current_strategy_daily_state = pd.Series(dtype=object)
     current_strategy_signal = results["structured_v2_signals"].iloc[-1] if not results["structured_v2_signals"].empty else pd.Series(dtype=object)
+    latest_allocation_date = results["structured_v2_weights"].index[-1]
+    latest_signal_date = results["structured_v2_signals"].index[-1] if not results["structured_v2_signals"].empty else None
     current_strategy_universe = ETF_TICKERS + [ticker for ticker in STRUCTURED_PROXY_TICKERS + CASH_PROXY_TICKERS if ticker in current_strategy_weights.index]
 else:
     current_strategy_name = "Base Rule Engine"
     current_strategy_weights = weights.sort_values(ascending=False)
+    current_strategy_daily_state = pd.Series(dtype=object)
     current_strategy_signal = pd.Series(dtype=object)
+    latest_allocation_date = None
+    latest_signal_date = None
     current_strategy_universe = ETF_TICKERS
 current_strategy_risk = portfolio_risk_estimates(current_strategy_weights)
 current_strategy_metrics = (
@@ -398,12 +436,85 @@ with tabs[0]:
     k3.metric("CAGR since 2023-07", f"{recovery_metrics.get('CAGR', np.nan):.2%}")
     st.caption("2020-10 이후 성과는 JAAA 상장 이후 공통기간입니다. 2023-07 이후 숫자는 최근 회복장만 자른 참고값입니다.")
 
+    if current_strategy_name == MAIN_STRATEGY_NAME:
+        st.markdown("#### Why this allocation?")
+        st.warning(
+            "현재 배분은 일별 모델 상태를 나타내며, 성과 백테스트는 기존 월별 리밸런싱 가정으로 계산됩니다."
+        )
+        _state_now = current_strategy_daily_state.get("State", "Normal")
+        _cash_gate_now = bool(current_strategy_daily_state.get("Cash Gate", False))
+        _defensive_asset = current_strategy_daily_state.get("Defensive Asset") or "—"
+        _core_rule_now = current_strategy_daily_state.get("Core Defense Rule", "Normal: core bucket in BOND")
+        _entry_votes = current_strategy_daily_state.get("Entry Risk Votes", np.nan)
+        _entry_pillars = current_strategy_daily_state.get("Entry Triggered Pillars", "") or "—"
+        _entry_override_names = [
+            label for label, key in [
+                ("Rate Shock", "Entry Override Rate Shock"),
+                ("Credit Spread", "Entry Override Credit Spread"),
+                ("Liquidity Stress", "Entry Override Liquidity Stress"),
+                ("Credit Volatility Combo", "Entry Override Credit Volatility Combo"),
+            ]
+            if current_strategy_daily_state.get(key)
+        ]
+        _entry_override_str = ", ".join(_entry_override_names) if _entry_override_names else "None"
+        _hold_elapsed = current_strategy_daily_state.get("Hold Days Elapsed", np.nan)
+        _hold_required = current_strategy_daily_state.get("Hold Days Required", np.nan)
+        _hold_met = current_strategy_daily_state.get("Hold Requirement Met")
+        _clear_elapsed = current_strategy_daily_state.get("Clear Days Elapsed", np.nan)
+        _clear_required = current_strategy_daily_state.get("Clear Days Required", np.nan)
+        _clear_met = current_strategy_daily_state.get("Clear Requirement Met")
+
+        _before_top = weights_before_change[weights_before_change.abs() > 1e-9].sort_values(ascending=False)
+        _after_top = weights_after_change[weights_after_change.abs() > 1e-9].sort_values(ascending=False)
+        _before_str = ", ".join(f"{ticker} {w:.0%}" for ticker, w in _before_top.items()) or "—"
+        _after_str = ", ".join(f"{ticker} {w:.0%}" for ticker, w in _after_top.items()) or "—"
+
+        if _cash_gate_now:
+            if _state_now == "Severe Risk":
+                _reason_now = f"방금 위험 신호가 발동해 {_defensive_asset}(으)로 진입"
+            elif _state_now == "Minimum Hold":
+                _reason_now = f"최소 보유기간({_hold_required:.0f}일)이 아직 끝나지 않아 {_defensive_asset} 유지 중"
+            else:
+                _reason_now = (
+                    f"Hold 요건은 충족했으나 연속 clear 일수({_clear_elapsed:.0f}/{_clear_required:.0f})가 "
+                    f"부족해 {_defensive_asset} 유지 중"
+                )
+        else:
+            _reason_now = _core_rule_now
+
+        _hold_text = "—" if pd.isna(_hold_elapsed) else f"{_hold_elapsed:.0f}/{_hold_required:.0f}일 ({'충족' if _hold_met else '미충족'})"
+        _clear_text = "—" if pd.isna(_clear_elapsed) else f"{_clear_elapsed:.0f}/{_clear_required:.0f}일 ({'충족' if _clear_met else '미충족'})"
+        _entry_votes_text = "—" if pd.isna(_entry_votes) else f"{_entry_votes:.0f}"
+
+        st.markdown(
+            f"<div class='rule-card'>"
+            f"<b>현재 모델 상태</b>: {_state_now} (Cash Gate: {_cash_gate_now})<br>"
+            f"<b>배분 기준일</b>: {latest_allocation_date.date().isoformat()}<br>"
+            f"<b>최근 배분 변경일</b>: {last_allocation_change_date.date().isoformat()}<br>"
+            f"<b>변경 전 비중</b>: {_before_str}<br>"
+            f"<b>변경 후 비중</b>: {_after_str}<br>"
+            f"<b>진입 당시 Risk Votes</b>: {_entry_votes_text} &nbsp;·&nbsp; "
+            f"<b>진입 당시 활성 Pillars</b>: {_entry_pillars} &nbsp;·&nbsp; "
+            f"<b>진입 당시 Override</b>: {_entry_override_str}<br>"
+            f"<b>선택된 방어자산</b>: {_defensive_asset if _cash_gate_now else '해당 없음 (평시 배분)'}<br>"
+            f"<b>Hold 경과/필요</b>: {_hold_text} &nbsp;·&nbsp; <b>Clear 충족 여부/연속 일수</b>: {_clear_text}<br>"
+            f"<b>현재 유지 이유</b>: {_reason_now}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
     left, right = st.columns([1, 1.15])
     with left:
         allocation = current_strategy_weights.rename("Weight").to_frame()
         if show_zero:
             allocation = allocation.reindex(current_strategy_universe, fill_value=0)
         st.subheader("Current Strategy Allocation")
+        if latest_allocation_date is not None:
+            signal_note = (
+                f" · Latest monthly signal snapshot {latest_signal_date.date().isoformat()}"
+                if latest_signal_date is not None else ""
+            )
+            st.caption(f"Current model allocation as of {latest_allocation_date.date().isoformat()}{signal_note}")
         st.bar_chart(allocation, horizontal=True, color="#ef625e")
         st.dataframe(allocation.style.format({"Weight": "{:.1%}"}), width="stretch")
     with right:
@@ -413,7 +524,7 @@ with tabs[0]:
                 f"<div class='rule-card'><b>Engine · {current_strategy_name}</b><br>"
                 f"<span class='muted'>Risk-first bond allocation: severe stress can move 100% to SGOV/BIL/USFR; normal markets use BOND/structured carry · "
                 f"Overlay rule: {current_strategy_signal.get('Overlay Rule', '—')} · "
-                f"Cash gate: {current_strategy_signal.get('Cash Gate', '—')}</span></div>",
+                f"Cash gate: {current_strategy_daily_state.get('Cash Gate', '—')}</span></div>",
                 unsafe_allow_html=True,
             )
         elif current_strategy_name == "Structured Proxy v2 Candidate":
@@ -427,14 +538,21 @@ with tabs[0]:
         mbs_score = current_strategy_signal.get("MBS RV Score", np.nan)
         credit_score = current_strategy_signal.get("Credit Cushion Score", np.nan)
         stress_label = current_strategy_signal.get("Overlay Risk", current_strategy_signal.get("Structured v2 Stress", "—"))
-        risk_votes = current_strategy_signal.get("Risk Votes", np.nan)
-        core_bucket = current_strategy_signal.get("BOND Core Weight", current_strategy_weights.get("BOND", 0.0))
-        core_asset = current_strategy_signal.get("Core Defense Asset", "BOND")
-        core_rule = current_strategy_signal.get("Core Defense Rule", "Normal: core bucket in BOND")
-        crisis_type = current_strategy_signal.get("Crisis Type", "Normal carry")
-        hedge_etf = current_strategy_signal.get("Hedge ETF", core_asset)
-        return_mode = current_strategy_signal.get("Return Mode", "Risk-first defense/base")
-        carry_basket_weight = current_strategy_signal.get("Carry Basket Weight", 0.0)
+        # Risk-gate fields (Cash Gate/Risk Votes/Core Defense/Crisis Type/...) come
+        # from the daily state, not the monthly signal snapshot, so this narrative
+        # never lags what "Current Strategy Allocation" above is actually showing.
+        risk_votes = current_strategy_daily_state.get("Risk Votes", current_strategy_signal.get("Risk Votes", np.nan))
+        core_bucket = current_strategy_daily_state.get(
+            "Risk-Gated Core Weight", current_strategy_signal.get("BOND Core Weight", current_strategy_weights.get("BOND", 0.0))
+        )
+        core_asset = current_strategy_daily_state.get("Core Defense Asset", current_strategy_signal.get("Core Defense Asset", "BOND"))
+        core_rule = current_strategy_daily_state.get(
+            "Core Defense Rule", current_strategy_signal.get("Core Defense Rule", "Normal: core bucket in BOND")
+        )
+        crisis_type = current_strategy_daily_state.get("Crisis Type", current_strategy_signal.get("Crisis Type", "Normal carry"))
+        hedge_etf = current_strategy_daily_state.get("Hedge ETF", current_strategy_signal.get("Hedge ETF", core_asset))
+        return_mode = current_strategy_daily_state.get("Return Mode", current_strategy_signal.get("Return Mode", "Risk-first defense/base"))
+        carry_basket_weight = 1.0 if return_mode == "JAAA-heavy normal carry basket" else current_strategy_signal.get("Carry Basket Weight", 0.0)
         carry_basket_assets = current_strategy_signal.get("Carry Basket Assets", ", ".join(NORMAL_CARRY_BASKET))
         if carry_basket_weight > 0:
             core_now = (
@@ -635,8 +753,9 @@ with tabs[2]:
     a, b = st.columns(2)
     with a:
         st.subheader("Main Strategy Allocation History")
-        if not results["bond_core_overlay_weights"].empty:
-            weight_long = results["bond_core_overlay_weights"].reset_index().rename(columns={"index":"Date"}).melt("Date", var_name="ETF", value_name="Weight")
+        st.caption("일별 current model allocation입니다 — 월말 신호를 ffill한 값이 아니라, 그날그날의 모델 상태를 그대로 반영합니다.")
+        if not results["bond_core_overlay_effective_weights"].empty:
+            weight_long = results["bond_core_overlay_effective_weights"].reset_index().rename(columns={"index":"Date"}).melt("Date", var_name="ETF", value_name="Weight")
             area = alt.Chart(weight_long).mark_area().encode(
                 x=alt.X("Date:T", title=None),
                 y=alt.Y("Weight:Q", stack="normalize", axis=alt.Axis(format="%")),
@@ -651,10 +770,41 @@ with tabs[2]:
             st.metric("연환산 평균 회전율", f"{monthly_turn.mean()*12:.0%}")
             line_chart(monthly_turn, "One-way Turnover", 245)
 
-    st.subheader("Main Strategy Signals")
+    st.subheader("Daily Allocation State")
+    st.caption(
+        "일별 모델 상태(Cash Gate/State/진입일/Hold·Clear 경과)와 그날의 current model allocation을 합친 표입니다. "
+        "다운로드 아이콘으로 별도 CSV 내보내기가 가능합니다 (아래 Monthly Signal Snapshots, Trade Log와는 분리된 파일입니다)."
+    )
+    daily_state_table = results["bond_core_overlay_daily_state"]
+    daily_weights_table = results["bond_core_overlay_effective_weights"]
+    if daily_state_table.empty:
+        st.info(f"{MAIN_STRATEGY_NAME} 일별 상태 데이터가 없습니다.")
+    else:
+        state_cols = [
+            "State", "Cash Gate", "Gate Entry Date", "Risk Votes", "Triggered Pillars",
+            "Override Rate Shock", "Override Credit Spread", "Override Liquidity Stress", "Override Credit Volatility Combo",
+            "Entry Risk Votes", "Entry Triggered Pillars",
+            "Entry Override Rate Shock", "Entry Override Credit Spread", "Entry Override Liquidity Stress", "Entry Override Credit Volatility Combo",
+            "Defensive Asset", "Hold Days Elapsed", "Hold Days Required", "Hold Requirement Met",
+            "Clear Days Elapsed", "Clear Days Required", "Clear Requirement Met",
+        ]
+        state_cols = [col for col in state_cols if col in daily_state_table]
+        daily_allocation_view = daily_state_table[state_cols].join(daily_weights_table, how="left")
+        daily_allocation_view = daily_allocation_view.tail(60).sort_index(ascending=False)
+        weight_format = {ticker: "{:.1%}" for ticker in daily_weights_table.columns}
+        st.dataframe(
+            daily_allocation_view.style.format({
+                **weight_format,
+                "Hold Days Elapsed": "{:.0f}", "Clear Days Elapsed": "{:.0f}",
+            }),
+            width="stretch",
+        )
+
+    st.subheader("Monthly Signal Snapshots")
+    st.caption("월말에만 재계산되는 진단 스냅샷입니다 (target_func 스코어카드 등). 현재 배분(Current Strategy Allocation/Daily Allocation State)에는 쓰이지 않습니다.")
     source_cols = ["MBS RV Score", "Credit Cushion Score", "Duration/MOVE Score", "Curve Score", "Real Yield Score", "Overlay Structured"]
-    if all(column in results["bond_core_overlay_signals"] for column in source_cols):
-        line_chart(results["bond_core_overlay_signals"][source_cols].tail(36), "Score / Weight", 260)
+    if all(column in results["bond_core_overlay_monthly_signals"] for column in source_cols):
+        line_chart(results["bond_core_overlay_monthly_signals"][source_cols].tail(36), "Score / Weight", 260)
     signal_cols = [
         "Regime", "Dominant Alpha", "Crisis Type", "Hedge ETF", "Core Allocation Rule", "Core Defense Asset", "Core Defense Rule", "Overlay Rule", "Overlay Risk", "BOND Core Weight", "Active Overlay Weight",
         "Return Mode", "Carry Basket Weight", "Carry Basket Assets",
@@ -663,8 +813,8 @@ with tabs[2]:
         "MOVE Percentile", "VIX Percentile", "NFCI", "HY OAS 3M", "10Y 3M Change",
         "JAAA vs SHY 1M", "BKLN vs SHY 1M", "CMBS vs MBB 3M", "Risk Votes", "Risk Pillars", "Triggered", "Cash Gate",
     ]
-    signal_cols = [col for col in signal_cols if col in results["bond_core_overlay_signals"]]
-    main_signals = results["bond_core_overlay_signals"][signal_cols].tail(24).sort_index(ascending=False)
+    signal_cols = [col for col in signal_cols if col in results["bond_core_overlay_monthly_signals"]]
+    main_signals = results["bond_core_overlay_monthly_signals"][signal_cols].tail(24).sort_index(ascending=False)
     st.dataframe(
         main_signals.style.format({
             "BOND Core Weight":"{:.0%}", "Active Overlay Weight":"{:.0%}",
@@ -680,10 +830,10 @@ with tabs[2]:
         width="stretch",
     )
     st.subheader("Main Strategy Trade Log")
-    if results["bond_core_overlay_trades"].empty:
+    if results["bond_core_overlay_trade_log"].empty:
         st.info(f"{MAIN_STRATEGY_NAME} 거래가 없습니다.")
     else:
-        trade_log = results["bond_core_overlay_trades"].tail(30).sort_index(ascending=False)
+        trade_log = results["bond_core_overlay_trade_log"].tail(30).sort_index(ascending=False)
         st.dataframe(trade_log.style.format({"Turnover":"{:.1%}", "HY OAS 3M":"{:+.2f}", "MOVE":"{:.1f}", "MOVE Percentile":"{:.0%}", "VIX Percentile":"{:.0%}", "HYG vs SHY 1M":"{:+.1%}", "Risk Votes":"{:.0f}"}), width="stretch")
     with st.expander("Structured Proxy v2 candidate grid"):
         if not results["structured_v2_summary"].empty:
@@ -753,7 +903,7 @@ with tabs[4]:
             p3.metric("Gross / Net", f"{latest_exposure['Gross / Net']:.2f}x")
             p4.metric("공시 포지션", f"{latest_exposure['Number of Positions']:,.0f}개")
 
-            aligned_positions, position_metrics = position_alignment(results["bond_core_overlay_weights"], bond_exposures)
+            aligned_positions, position_metrics = position_alignment(results["bond_core_overlay_effective_weights"], bond_exposures)
             if position_metrics:
                 a1, a2, a3 = st.columns(3)
                 a1.metric("포지션 변화 방향 일치율", f"{position_metrics['Direction Match']:.0%}")
@@ -786,8 +936,8 @@ with tabs[4]:
             line_chart(quality, "Share of funded holdings", 260)
             st.caption("N-PORT에는 신용등급 필드가 없어 Government+Agency MBS를 High Quality, Non-Agency MBS+ABS/CLO+Credit/Loans를 Spread Risk 프록시로 사용합니다. 실제 평균 신용등급으로 해석하면 안 됩니다.")
 
-            mbs_gap_weights = results["bond_core_overlay_weights"]
-            mbs_gap_signals = results["bond_core_overlay_signals"]
+            mbs_gap_weights = results["bond_core_overlay_effective_weights"]
+            mbs_gap_signals = results["bond_core_overlay_monthly_signals"]
             mbs_gap, mbs_gap_metrics = mbs_gap_diagnostic(mbs_gap_weights, bond_exposures, mbs_gap_signals)
             if not mbs_gap.empty:
                 st.markdown("### MBS RV Gap Diagnostic")
