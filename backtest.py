@@ -678,6 +678,15 @@ def _severe_risk_snapshot(prices: pd.DataFrame, fred: pd.DataFrame, date: pd.Tim
         or nfci >= 0.35
     )
     vote_count = int(sum(pillars.values()))
+    # Named overrides (C1-C4): each can independently make `severe` True even when
+    # vote_count < entry_votes. Exposed here purely as read-only diagnostics -- none
+    # of this changes the `severe` expression below, which is untouched.
+    override_rate_shock = bool(
+        np.isfinite(move_pct) and move_pct >= RISK_CONFIG.move_percentile_crisis and ten_year_3m >= 0.15
+    )
+    override_credit_spread = bool(context["hy_3m"] >= 0.90)
+    override_liquidity_stress = bool(nfci >= 0.35)
+    override_credit_volatility_combo = bool(context["hy_3m"] >= 1.25 and volatility_extreme)
     severe = vote_count >= RISK_CONFIG.entry_votes or warning or (context["hy_3m"] >= 1.25 and volatility_extreme)
     return bool(severe), {
         "Risk Votes": vote_count, "Risk Pillars": ", ".join(name for name, active in pillars.items() if active) or "None",
@@ -687,7 +696,83 @@ def _severe_risk_snapshot(prices: pd.DataFrame, fred: pd.DataFrame, date: pd.Tim
         "VIX Percentile": context["vix_pct"], "Unemployment Gap": context["unrate_delta"],
         "NFCI": nfci, "HYG vs SHY 1M": hyg_relative_1m,
         "Triggered": ", ".join(name for name, active in pillars.items() if active) or "None",
+        "Override Rate Shock": override_rate_shock,
+        "Override Credit Spread": override_credit_spread,
+        "Override Liquidity Stress": override_liquidity_stress,
+        "Override Credit Volatility Combo": override_credit_volatility_combo,
     }
+
+
+def _core_defense_decision(
+    *,
+    cash_gate: bool,
+    move_pct: float,
+    vix_pct: float,
+    duration_score: float,
+    ten_year_3m: float,
+    hy_3m: float,
+    risk_votes: float,
+    nfci: float,
+    credit_score: float,
+    unrate_gap: float,
+    regime: str,
+    cash_asset: str,
+    tlt_available: bool,
+    normal_core_weight: float = DEFAULT_BOND_CORE_WEIGHT,
+) -> tuple[str, str, float, str, str]:
+    """BOND-core defense/hedge decision: what asset (and how much of the core
+    bucket) to hold given today's risk state.
+
+    Extracted, byte-for-byte identical in logic/thresholds, from the nested
+    `core_defense` closure that used to live only inside
+    `run_bond_core_overlay_backtest` (reading a pandas Series `row`). Making it
+    a plain module-level function with explicit parameters lets both the
+    monthly signals path (run_bond_core_overlay_backtest) and the new daily
+    state path (run_alpha_replica_backtest's loop) call the exact same
+    decision logic, so there is only ever one implementation to keep in sync.
+    """
+    if cash_gate:
+        return cash_asset, f"Cash gate active: 100% defensive {cash_asset}", 1.00, "Cooldown / cash gate", cash_asset
+    rate_shock = (
+        np.isfinite(move_pct) and move_pct >= RISK_CONFIG.move_percentile_warning
+        and (
+            duration_score <= -0.5
+            or (np.isfinite(ten_year_3m) and ten_year_3m >= 0.15)
+        )
+    )
+    severe_credit = risk_votes >= RISK_CONFIG.entry_votes or hy_3m >= 0.90 or nfci >= 0.35
+    flight_to_quality = (
+        (risk_votes >= 1 or (np.isfinite(vix_pct) and vix_pct >= 0.85) or hy_3m >= 0.45 or unrate_gap >= RISK_CONFIG.unemployment_gap_warning)
+        and np.isfinite(ten_year_3m) and ten_year_3m <= -0.15
+        and duration_score >= 0.5
+    )
+    early_stress = (
+        risk_votes >= 1
+        or hy_3m >= 0.45
+        or nfci >= 0.15
+        or credit_score <= -1.0
+        or (np.isfinite(move_pct) and move_pct >= 0.82 and duration_score < 0)
+    )
+    recession_duration = (
+        (regime == "Disinflation / Recession" or unrate_gap >= RISK_CONFIG.unemployment_gap_warning)
+        and duration_score >= 0.75
+        and (not np.isfinite(move_pct) or move_pct < RISK_CONFIG.move_percentile_warning)
+    )
+    if rate_shock:
+        return cash_asset, f"Rate/MOVE shock: 100% defensive core to {cash_asset}", 1.00, "Rate / inflation shock", cash_asset
+    if flight_to_quality:
+        tlt_allowed = duration_score >= 1.5 and (risk_votes >= 1 or (np.isfinite(vix_pct) and vix_pct >= 0.85)) and hy_3m < 0.70
+        hedge_asset = "TLT" if tlt_allowed and tlt_available else "IEF"
+        hedge_weight = 0.85 if severe_credit else 0.75
+        return hedge_asset, f"Flight-to-quality: {hedge_weight:.0%} core to {hedge_asset}", hedge_weight, "Recession / flight-to-quality", hedge_asset
+    if severe_credit:
+        return cash_asset, f"Severe credit/liquidity stress: 100% defensive core to {cash_asset}", 1.00, "Credit / liquidity shock", cash_asset
+    if recession_duration:
+        hedge_asset = "IEF"
+        return hedge_asset, f"Disinflation/recession hedge: 70% core to {hedge_asset}", 0.70, "Recession / duration hedge", hedge_asset
+    if early_stress:
+        return cash_asset, f"Early stress: 70% defensive core to {cash_asset}", 0.70, "Early warning", cash_asset
+    return "BOND", "Normal: core bucket in BOND", float(normal_core_weight), "Normal carry", "BOND"
 
 
 def run_alpha_replica_backtest(
@@ -699,14 +784,25 @@ def run_alpha_replica_backtest(
     target_func=_alpha_replica_target,
     label: str = "Alpha Replica v2",
     tickers: list[str] | None = None,
+    compute_core_blend: bool = False,
 ) -> dict:
-    """Monthly concentrated alpha target with an immediate severe-risk cash gate."""
+    """Monthly concentrated alpha target with an immediate severe-risk cash gate.
+
+    When `compute_core_blend=True` (used only by run_bond_core_overlay_backtest),
+    this loop additionally records, on every trading day, the actually-decided
+    cash-gate state and the actually-held (BOND-core + overlay sleeve, blended)
+    portfolio weight -- see `daily_state` / `effective_weights` in the return
+    dict. Both are recorded directly at the point the state machine already
+    decides them each day; nothing about `monthly_returns`/`weights`/`turnover`/
+    `signals`/`trades` below is changed by this flag.
+    """
     universe = tickers or ETF_TICKERS
     asset_returns = prices[universe].pct_change(fill_method=None)
     dates = asset_returns.index[(asset_returns.index >= common_start) & asset_returns.notna().all(axis=1)]
     if len(dates) < 20:
         return {"monthly_returns": pd.Series(dtype=float), "weights": pd.DataFrame(),
-                "turnover": pd.Series(dtype=float), "signals": pd.DataFrame(), "trades": pd.DataFrame()}
+                "turnover": pd.Series(dtype=float), "signals": pd.DataFrame(), "trades": pd.DataFrame(),
+                "daily_state": pd.DataFrame(), "effective_weights": pd.DataFrame()}
 
     current, target = target_func(prices, fred, dates[0])[0].reindex(universe, fill_value=0.0), None
     in_cash = False
@@ -718,6 +814,25 @@ def run_alpha_replica_backtest(
     signal_rows: list[dict] = []
     trades: list[dict] = []
 
+    # -- daily_state / effective_weights bookkeeping (additive; read-only w.r.t.
+    # everything above) --------------------------------------------------
+    daily_state_rows: list[dict] = []
+    effective_weight_rows: list[pd.Series] = []
+    last_diagnostics: dict = {}
+    held_cash_asset = ""
+    entry_risk_votes: float = np.nan
+    entry_pillars = ""
+    entry_override_rate_shock: bool | None = None
+    entry_override_credit_spread: bool | None = None
+    entry_override_liquidity_stress: bool | None = None
+    entry_override_credit_volatility_combo: bool | None = None
+    tlt_available = "TLT" in universe
+    carry_basket_assets = (
+        [ticker for ticker in NORMAL_CARRY_BASKET if ticker in prices and prices[ticker].dropna().shape[0] >= 252]
+        if compute_core_blend else []
+    )
+    full_universe = ["BOND"] + [ticker for ticker in universe if ticker != "BOND"] if compute_core_blend else list(universe)
+
     for position, date in enumerate(dates):
         day_return = float((current * asset_returns.loc[date].fillna(0.0)).sum())
         daily_result[date] = day_return
@@ -725,6 +840,7 @@ def run_alpha_replica_backtest(
             current = current.mul(1 + asset_returns.loc[date].fillna(0.0)).div(1 + day_return)
 
         severe, risk = _severe_risk_snapshot(prices, fred, date, vol_signal=vol_signal)
+        previous_in_cash = in_cash
         next_date = dates[position + 1] if position + 1 < len(dates) else date + pd.Timedelta(days=7)
         month_end = next_date.month != date.month
         reason = None
@@ -758,6 +874,115 @@ def run_alpha_replica_backtest(
                 _, diagnostics = target_func(prices, fred, date)
             signal_rows.append({"Date": date, **diagnostics, **risk, "Cash Gate": in_cash})
 
+        if diagnostics is not None:
+            last_diagnostics = diagnostics
+
+        # Freeze the entry-day risk snapshot; carry it forward unchanged for the
+        # whole cash-gate spell so "why did we enter" stays distinguishable from
+        # "what does risk look like right now" (which keeps changing/clearing).
+        if in_cash and not previous_in_cash:
+            held_cash_asset = cash_asset
+            entry_risk_votes = risk["Risk Votes"]
+            entry_pillars = risk["Triggered"]
+            entry_override_rate_shock = risk["Override Rate Shock"]
+            entry_override_credit_spread = risk["Override Credit Spread"]
+            entry_override_liquidity_stress = risk["Override Liquidity Stress"]
+            entry_override_credit_volatility_combo = risk["Override Credit Volatility Combo"]
+        elif not in_cash and previous_in_cash:
+            held_cash_asset = ""
+            entry_risk_votes = np.nan
+            entry_pillars = ""
+            entry_override_rate_shock = None
+            entry_override_credit_spread = None
+            entry_override_liquidity_stress = None
+            entry_override_credit_volatility_combo = None
+
+        if not in_cash:
+            state = "Normal"
+        elif severe:
+            state = "Severe Risk"
+        elif (position - cash_start) < RISK_CONFIG.minimum_hold_days:
+            state = "Minimum Hold"
+        else:
+            state = "Clear Confirmation"
+
+        hold_elapsed = (position - cash_start) if in_cash else np.nan
+        clear_elapsed = clear_days if in_cash else np.nan
+        hold_met = bool(hold_elapsed >= RISK_CONFIG.minimum_hold_days) if in_cash else None
+        clear_met = bool(clear_elapsed >= RISK_CONFIG.exit_clear_days) if in_cash else None
+        gate_entry_date = dates[cash_start] if (in_cash and cash_start >= 0) else pd.NaT
+
+        state_row = {
+            "Date": date,
+            "State": state,
+            "Cash Gate": in_cash,
+            "Gate Entry Date": gate_entry_date,
+            "Risk Votes": risk["Risk Votes"],
+            "Triggered Pillars": risk["Triggered"],
+            "Override Rate Shock": risk["Override Rate Shock"],
+            "Override Credit Spread": risk["Override Credit Spread"],
+            "Override Liquidity Stress": risk["Override Liquidity Stress"],
+            "Override Credit Volatility Combo": risk["Override Credit Volatility Combo"],
+            "Entry Risk Votes": entry_risk_votes,
+            "Entry Triggered Pillars": entry_pillars,
+            "Entry Override Rate Shock": entry_override_rate_shock,
+            "Entry Override Credit Spread": entry_override_credit_spread,
+            "Entry Override Liquidity Stress": entry_override_liquidity_stress,
+            "Entry Override Credit Volatility Combo": entry_override_credit_volatility_combo,
+            "Defensive Asset": held_cash_asset if in_cash else "",
+            "Hold Days Elapsed": hold_elapsed,
+            "Hold Days Required": RISK_CONFIG.minimum_hold_days,
+            "Hold Requirement Met": hold_met,
+            "Clear Days Elapsed": clear_elapsed,
+            "Clear Days Required": RISK_CONFIG.exit_clear_days,
+            "Clear Requirement Met": clear_met,
+        }
+
+        if compute_core_blend:
+            cash_asset_fresh = _defensive_cash_asset(prices, date, universe)
+            cash_asset_for_defense = held_cash_asset if in_cash else cash_asset_fresh
+            core_asset, core_rule, core_weight, crisis_type, hedge_etf = _core_defense_decision(
+                cash_gate=in_cash,
+                move_pct=risk["MOVE Percentile"],
+                vix_pct=risk["VIX Percentile"],
+                duration_score=float(last_diagnostics.get("Duration/MOVE Score", 0.0)),
+                ten_year_3m=risk["10Y 3M Change"],
+                hy_3m=risk["HY OAS 3M"],
+                risk_votes=risk["Risk Votes"],
+                nfci=risk["NFCI"],
+                credit_score=float(last_diagnostics.get("Credit Cushion Score", 0.0)),
+                unrate_gap=risk["Unemployment Gap"],
+                regime=last_diagnostics.get("Regime", ""),
+                cash_asset=cash_asset_for_defense,
+                tlt_available=tlt_available,
+                normal_core_weight=float(last_diagnostics.get("BOND Core Weight", DEFAULT_BOND_CORE_WEIGHT)),
+            )
+            active_weight = 1.0 - core_weight
+            blended = current.reindex(universe, fill_value=0.0) * active_weight
+            blended = blended.reindex(full_universe, fill_value=0.0)
+            blended.loc[core_asset] = blended.get(core_asset, 0.0) + core_weight
+            return_mode = "Risk-first defense/base"
+            if crisis_type == "Normal carry" and core_asset == "BOND" and carry_basket_assets:
+                raw_weights = pd.Series(NORMAL_CARRY_BASKET).reindex(carry_basket_assets).astype(float)
+                raw_weights = raw_weights / raw_weights.sum()
+                blended = pd.Series(0.0, index=full_universe)
+                for ticker, weight in raw_weights.items():
+                    blended.loc[ticker] = weight
+                return_mode = "JAAA-heavy normal carry basket"
+            effective_weight_rows.append(blended.rename(date))
+            state_row.update({
+                "Core Defense Asset": core_asset,
+                "Core Defense Rule": core_rule,
+                "Risk-Gated Core Weight": core_weight,
+                "Crisis Type": crisis_type,
+                "Hedge ETF": hedge_etf,
+                "Return Mode": return_mode,
+            })
+        else:
+            effective_weight_rows.append(current.reindex(universe, fill_value=0.0).rename(date))
+
+        daily_state_rows.append(state_row)
+
     daily = pd.Series(daily_result, name=label).sort_index()
     return {
         "monthly_returns": (1 + daily).resample("ME").prod() - 1,
@@ -765,6 +990,8 @@ def run_alpha_replica_backtest(
         "turnover": pd.Series(turnover_rows, name="Alpha Replica Turnover").sort_index(),
         "signals": pd.DataFrame(signal_rows).set_index("Date"),
         "trades": pd.DataFrame(trades).set_index("Date") if trades else pd.DataFrame(),
+        "daily_state": pd.DataFrame(daily_state_rows).set_index("Date").sort_index(),
+        "effective_weights": pd.DataFrame(effective_weight_rows).fillna(0.0).sort_index(),
     }
 
 
@@ -790,6 +1017,8 @@ def run_bond_core_overlay_backtest(
         "signals": pd.DataFrame(),
         "trades": pd.DataFrame(),
         "overlay": {},
+        "daily_state": pd.DataFrame(),
+        "effective_weights": pd.DataFrame(),
     }
     if bond_returns is None or not len(bond_returns.dropna()):
         return empty
@@ -803,6 +1032,7 @@ def run_bond_core_overlay_backtest(
         target_func=_aggressive_ra_overlay_target,
         label="Aggressive RA Overlay",
         tickers=universe,
+        compute_core_blend=True,
     )
     overlay_returns = overlay["monthly_returns"].dropna()
     aligned = pd.concat(
@@ -825,61 +1055,28 @@ def run_bond_core_overlay_backtest(
     else:
         signal_core = signals["BOND Core Weight"].clip(0.50, 0.90).copy()
 
+        tlt_available = "TLT" in universe
+
         def core_defense(row: pd.Series) -> tuple[str, str, float, str, str]:
-            move_pct = float(row.get("MOVE Percentile", np.nan))
-            vix_pct = float(row.get("VIX Percentile", np.nan))
-            duration_score = float(row.get("Duration/MOVE Score", 0.0))
-            ten_year_3m = float(row.get("10Y 3M Change", np.nan))
-            hy_3m = float(row.get("HY OAS 3M", 0.0))
-            risk_votes = float(row.get("Risk Votes", 0.0))
-            nfci = float(row.get("NFCI", 0.0))
-            credit_score = float(row.get("Credit Cushion Score", 0.0))
-            unrate_gap = float(row.get("Unemployment Gap", 0.0))
-            cash_gate = bool(row.get("Cash Gate", False))
-            regime = row.get("Regime", "")
-            cash_asset = _defensive_cash_asset(prices, row.name, universe)
-            if cash_gate:
-                return cash_asset, f"Cash gate active: 100% defensive {cash_asset}", 1.00, "Cooldown / cash gate", cash_asset
-            rate_shock = (
-                np.isfinite(move_pct) and move_pct >= RISK_CONFIG.move_percentile_warning
-                and (
-                    duration_score <= -0.5
-                    or (np.isfinite(ten_year_3m) and ten_year_3m >= 0.15)
-                )
+            # Delegates to the module-level _core_defense_decision (identical
+            # logic/thresholds) so this monthly path and the daily path in
+            # run_alpha_replica_backtest can never drift apart.
+            return _core_defense_decision(
+                cash_gate=bool(row.get("Cash Gate", False)),
+                move_pct=float(row.get("MOVE Percentile", np.nan)),
+                vix_pct=float(row.get("VIX Percentile", np.nan)),
+                duration_score=float(row.get("Duration/MOVE Score", 0.0)),
+                ten_year_3m=float(row.get("10Y 3M Change", np.nan)),
+                hy_3m=float(row.get("HY OAS 3M", 0.0)),
+                risk_votes=float(row.get("Risk Votes", 0.0)),
+                nfci=float(row.get("NFCI", 0.0)),
+                credit_score=float(row.get("Credit Cushion Score", 0.0)),
+                unrate_gap=float(row.get("Unemployment Gap", 0.0)),
+                regime=row.get("Regime", ""),
+                cash_asset=_defensive_cash_asset(prices, row.name, universe),
+                tlt_available=tlt_available,
+                normal_core_weight=float(row.get("BOND Core Weight", DEFAULT_BOND_CORE_WEIGHT)),
             )
-            severe_credit = risk_votes >= RISK_CONFIG.entry_votes or hy_3m >= 0.90 or nfci >= 0.35
-            flight_to_quality = (
-                (risk_votes >= 1 or (np.isfinite(vix_pct) and vix_pct >= 0.85) or hy_3m >= 0.45 or unrate_gap >= RISK_CONFIG.unemployment_gap_warning)
-                and np.isfinite(ten_year_3m) and ten_year_3m <= -0.15
-                and duration_score >= 0.5
-            )
-            early_stress = (
-                risk_votes >= 1
-                or hy_3m >= 0.45
-                or nfci >= 0.15
-                or credit_score <= -1.0
-                or (np.isfinite(move_pct) and move_pct >= 0.82 and duration_score < 0)
-            )
-            recession_duration = (
-                (regime == "Disinflation / Recession" or unrate_gap >= RISK_CONFIG.unemployment_gap_warning)
-                and duration_score >= 0.75
-                and (not np.isfinite(move_pct) or move_pct < RISK_CONFIG.move_percentile_warning)
-            )
-            if rate_shock:
-                return cash_asset, f"Rate/MOVE shock: 100% defensive core to {cash_asset}", 1.00, "Rate / inflation shock", cash_asset
-            if flight_to_quality:
-                tlt_allowed = duration_score >= 1.5 and (risk_votes >= 1 or (np.isfinite(vix_pct) and vix_pct >= 0.85)) and hy_3m < 0.70
-                hedge_asset = "TLT" if tlt_allowed and "TLT" in universe else "IEF"
-                hedge_weight = 0.85 if severe_credit else 0.75
-                return hedge_asset, f"Flight-to-quality: {hedge_weight:.0%} core to {hedge_asset}", hedge_weight, "Recession / flight-to-quality", hedge_asset
-            if severe_credit:
-                return cash_asset, f"Severe credit/liquidity stress: 100% defensive core to {cash_asset}", 1.00, "Credit / liquidity shock", cash_asset
-            if recession_duration:
-                hedge_asset = "IEF"
-                return hedge_asset, f"Disinflation/recession hedge: 70% core to {hedge_asset}", 0.70, "Recession / duration hedge", hedge_asset
-            if early_stress:
-                return cash_asset, f"Early stress: 70% defensive core to {cash_asset}", 0.70, "Early warning", cash_asset
-            return "BOND", "Normal: core bucket in BOND", float(row.get("BOND Core Weight", DEFAULT_BOND_CORE_WEIGHT)), "Normal carry", "BOND"
 
         defense = signals.apply(core_defense, axis=1, result_type="expand")
         defense.columns = ["Core Defense Asset", "Core Defense Rule", "Risk-Gated Core Weight", "Crisis Type", "Hedge ETF"]
@@ -953,6 +1150,20 @@ def run_bond_core_overlay_backtest(
             - carry_switch_cost
         ).rename(MAIN_STRATEGY_NAME)
 
+    # `display_*` below are month-end-derived approximations, kept ONLY to scale
+    # the aggregate turnover metric (an existing, unchanged calculation) -- they
+    # are never used as "current allocation" or "allocation history" anymore.
+    # The actual per-day allocation is `effective_weights`/`daily_state`, computed
+    # once inside run_alpha_replica_backtest's own loop (see compute_core_blend)
+    # and passed through as-is here: no re-derivation, no ffill, no mixing of
+    # daily and month-end resolutions to build "what do we hold right now".
+    # `weights` below is restored to its exact original construction (a
+    # month-end-signal-derived, ffilled approximation) so that key's value,
+    # frequency, and columns are unchanged from before the daily-state fix --
+    # it is kept only for backward compatibility with any caller still reading
+    # it under that name. The correct, daily-accurate allocation is exposed
+    # separately as `effective_weights` below; nothing reads `weights` to
+    # build "current allocation" anymore (see app.py).
     overlay_weights = overlay["weights"].reindex(columns=universe, fill_value=0.0)
     if not signals.empty:
         overlay_weights = overlay_weights.reindex(overlay_weights.index.union(signals.index).sort_values()).ffill().fillna(0.0)
@@ -970,7 +1181,10 @@ def run_bond_core_overlay_backtest(
             full_weights[asset] = 0.0
         full_weights.loc[date, asset] = full_weights.loc[date, asset] + display_core.loc[date]
 
-    display_crisis_type = signal_crisis_type.reindex(full_weights.index).ffill().fillna("Normal carry") if not signals.empty else pd.Series("Normal carry", index=full_weights.index)
+    display_crisis_type = (
+        signal_crisis_type.reindex(full_weights.index).ffill().fillna("Normal carry")
+        if not signals.empty else pd.Series("Normal carry", index=full_weights.index)
+    )
     display_carry_basket = (
         display_crisis_type.eq("Normal carry")
         & display_core_asset.reindex(full_weights.index).ffill().fillna("BOND").eq("BOND")
@@ -992,6 +1206,12 @@ def run_bond_core_overlay_backtest(
             fill_value=0.0,
         )
     full_weights = full_weights.loc[full_weights.index >= combined.index.min()]
+
+    daily_state = overlay["daily_state"]
+    effective_weights = overlay["effective_weights"]
+    if not effective_weights.empty:
+        effective_weights = effective_weights.loc[effective_weights.index >= combined.index.min()]
+        daily_state = daily_state.loc[daily_state.index.isin(effective_weights.index)]
 
     turnover = overlay["turnover"].reindex(display_active.index).fillna(0.0).mul(display_active, axis=0)
     turnover = turnover.add(display_core.diff().abs().fillna(0.0), fill_value=0.0)
@@ -1020,6 +1240,8 @@ def run_bond_core_overlay_backtest(
         "signals": signals,
         "trades": trades,
         "overlay": overlay,
+        "daily_state": daily_state.sort_index(),
+        "effective_weights": effective_weights.sort_index(),
     }
 
 
@@ -1260,9 +1482,17 @@ def run_backtest(
         "structured_v2_best_name": structured_v2_best,
         "bond_core_overlay_weights": bond_core_overlay["weights"],
         "bond_core_overlay_turnover": bond_core_overlay["turnover"],
+        # Monthly diagnostic snapshots (Main Strategy Signals): unchanged, month-end only.
         "bond_core_overlay_signals": bond_core_overlay["signals"],
+        "bond_core_overlay_monthly_signals": bond_core_overlay["signals"],
+        # Trade blotter: unchanged, one row per actual trade (daily-dated).
         "bond_core_overlay_trades": bond_core_overlay["trades"],
+        "bond_core_overlay_trade_log": bond_core_overlay["trades"],
         "bond_core_overlay_overlay": bond_core_overlay["overlay"],
+        # Daily-resolution state machine + actually-held weights (the fix): use
+        # these, never bond_core_overlay_signals, for "current allocation".
+        "bond_core_overlay_daily_state": bond_core_overlay["daily_state"],
+        "bond_core_overlay_effective_weights": bond_core_overlay["effective_weights"],
         "metrics": performance_metrics(returns, rf, benchmark_returns),
         "structured_v2_metrics": performance_metrics(structured_v2_returns, rf, benchmark_returns),
         "bond_core_overlay_metrics": performance_metrics(bond_core_overlay_returns, rf, benchmark_returns),
