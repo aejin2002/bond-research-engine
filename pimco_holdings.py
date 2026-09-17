@@ -245,9 +245,11 @@ def parse_nq_filing(payload: bytes, fund_name: str = NQ_BOND_FUND_NAME) -> tuple
 
     Unlike parse_nport_xml(), this does not sum individual holdings: N-Q
     "Schedule of Investments" sections already print each top-level sector's
-    weight as a percent of net assets, so those header lines are read
-    directly. Effective Duration / KRDs are not available in N-Q and are
-    left out of the summary (callers should treat them as NaN).
+    weight as a percent of (leveraged) net assets, so those header lines are
+    read directly, then rescaled by the fund's Gross/Net ratio so the
+    returned exposures sum to ~100% like parse_nport_xml()'s do. Effective
+    Duration / KRDs are not available in N-Q and are left out of the summary
+    (callers should treat them as NaN).
     """
     text = _strip_html_to_text(payload)
     section = _slice_fund_section(text, fund_name)
@@ -280,8 +282,15 @@ def parse_nq_filing(payload: bytes, fund_name: str = NQ_BOND_FUND_NAME) -> tuple
         bucket = NQ_SECTOR_ALIASES[canonical_name]
         bucket_totals[bucket] = bucket_totals.get(bucket, 0.0) + weight
 
+    # N-Q sector weights are % of leveraged net assets (they sum to
+    # Total Investments%, e.g. 160.2%), while parse_nport_xml() normalizes
+    # by funded market value so its sectors sum to 100%. Dividing by the
+    # same Gross/Net ratio used for "Gross / Net" rescales N-Q onto that
+    # same 100%-sum basis, so pre- and post-2019 rows stay comparable in
+    # position_alignment().
+    scale = gross_to_net if gross_to_net and np.isfinite(gross_to_net) and gross_to_net > 0 else 1.0
     exposures = {
-        column: bucket_totals.get(bucket, 0.0) for bucket, column in NQ_BUCKET_TO_EXPOSURE_COLUMN.items()
+        column: bucket_totals.get(bucket, 0.0) / scale for bucket, column in NQ_BUCKET_TO_EXPOSURE_COLUMN.items()
     }
     exposures["High Quality Proxy"] = exposures["Government Related"] + exposures["Agency MBS"]
     exposures["Spread Risk Proxy"] = (
