@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import html as html_module
 import io
 import json
 import os
+import re
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -165,6 +167,141 @@ def parse_nport_xml(payload: bytes) -> tuple[dict, pd.DataFrame]:
         summary["Non-Agency MBS"] + summary["ABS / CLO"] + summary["Credit & Loans"]
     )
     return summary, holdings
+
+
+# --- Pre-2019 N-Q parsing -----------------------------------------------
+# N-Q (rescinded in 2019 when N-PORT-P became mandatory) reported sector
+# weights directly in the "Schedule of Investments" header lines (e.g.
+# "U.S. GOVERNMENT AGENCIES 60.4%"), so unlike N-PORT we don't sum
+# individual holdings — we read PIMCO's own published sector percentages.
+# There is no dv01/KRD data in this era, so Effective Duration and the KRD
+# columns are left absent (NaN) for these rows.
+NQ_BOND_FUND_NAME = "PIMCO Total Return Exchange"
+
+# Canonical N-Q "Schedule of Investments" category headers -> internal bucket.
+# Sub-category breakdowns nested under a header (e.g. "BANKING & FINANCE"
+# under "CORPORATE BONDS & NOTES") are intentionally not matched here: only
+# these literal top-level names are searched for, so nested subtotals never
+# get double-counted.
+NQ_SECTOR_ALIASES: dict[str, str] = {
+    "CORPORATE BONDS & NOTES": "credit",
+    "CONVERTIBLE BONDS & NOTES": "credit",
+    "SOVEREIGN ISSUES": "credit",
+    "MUNICIPAL BONDS & NOTES": "muni",
+    "U.S. TREASURY OBLIGATIONS": "govt",
+    # PIMCO's N-Q "U.S. GOVERNMENT AGENCIES" bucket is overwhelmingly agency
+    # MBS pass-throughs (Fannie/Freddie/Ginnie) for this fund, so it is
+    # mapped to Agency MBS. A minority of pure agency debt (e.g. FHLB
+    # discount notes) gets folded in here too -- a known approximation.
+    "U.S. GOVERNMENT AGENCIES": "agency_mbs",
+    # This section holds privately-issued (non-agency) CMOs/RMBS/CMBS.
+    "MORTGAGE-BACKED SECURITIES": "non_agency_mbs",
+    "ASSET-BACKED SECURITIES": "abs_clo",
+    "SHORT-TERM INSTRUMENTS": "cash",
+}
+
+NQ_BUCKET_TO_EXPOSURE_COLUMN: dict[str, str] = {
+    "govt": "Government Related",
+    "agency_mbs": "Agency MBS",
+    "non_agency_mbs": "Non-Agency MBS",
+    "abs_clo": "ABS / CLO",
+    "credit": "Credit & Loans",
+    "muni": "Municipal / Other",
+    "cash": "Cash & Repo",
+}
+
+
+def _strip_html_to_text(payload: bytes) -> str:
+    text = payload.decode("utf-8", errors="replace")
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", "\n", text)
+    text = html_module.unescape(text)
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n[ \t]*\n+", "\n", text)
+    return text
+
+
+def _slice_fund_section(text: str, fund_name: str) -> str:
+    headings = [m.start() for m in re.finditer(r"Schedule of Investments", text)]
+    if not headings:
+        raise ValueError("N-Q 문서에서 'Schedule of Investments' 섹션을 찾지 못했습니다 (포맷이 다를 수 있음).")
+    # PIMCO ETF Trust N-Q filings bundle every series in one document, in the
+    # order listed in the Item 1 table of contents; the fund name may use a
+    # hyphen or an en-dash ("Exchange-Traded" vs "Exchange–Traded"), so match
+    # loosely rather than on an exact literal.
+    loose_pattern = re.compile(re.escape(fund_name).replace(r"\ ", r"[\s‐-―-]+"))
+    for index, start in enumerate(headings):
+        end = headings[index + 1] if index + 1 < len(headings) else min(start + 6000, len(text))
+        window = text[start:end]
+        if fund_name in window or loose_pattern.search(window):
+            section_end = headings[index + 1] if index + 1 < len(headings) else len(text)
+            return text[start:section_end]
+    raise ValueError(f"'{fund_name}' 섹션을 N-Q 필링에서 찾지 못했습니다.")
+
+
+def parse_nq_filing(payload: bytes, fund_name: str = NQ_BOND_FUND_NAME) -> tuple[dict, dict[str, float]]:
+    """Parse a pre-2019 N-Q filing's sector weights for one series within it.
+
+    Unlike parse_nport_xml(), this does not sum individual holdings: N-Q
+    "Schedule of Investments" sections already print each top-level sector's
+    weight as a percent of net assets, so those header lines are read
+    directly. Effective Duration / KRDs are not available in N-Q and are
+    left out of the summary (callers should treat them as NaN).
+    """
+    text = _strip_html_to_text(payload)
+    section = _slice_fund_section(text, fund_name)
+
+    report_date = None
+    period_match = re.search(r"Date of reporting period:\s*([A-Za-z]+ \d{1,2},\s*\d{4})", text)
+    if period_match:
+        report_date = pd.Timestamp(period_match.group(1))
+    else:
+        local_date = re.search(r"([A-Za-z]+ \d{1,2},?\s*\d{4})\s*\(Unaudited\)", section)
+        if local_date:
+            report_date = pd.Timestamp(local_date.group(1))
+
+    net_assets_match = re.search(r"Net Assets\s+100\.0%\s*\$?\s*([\d,]+)", section)
+    if not net_assets_match:
+        raise ValueError("N-Q 섹션에서 'Net Assets 100.0%' 라인을 찾지 못했습니다.")
+    net_assets = float(net_assets_match.group(1).replace(",", "")) * 1_000  # figures are reported in (000s)
+
+    leverage_match = re.search(r"Total Investments\s+([\d.]+)%", section)
+    gross_to_net = float(leverage_match.group(1)) / 100 if leverage_match else np.nan
+
+    raw_weights: dict[str, float] = {}
+    for canonical_name in NQ_SECTOR_ALIASES:
+        match = re.search(re.escape(canonical_name) + r"\s+([\d.]+)%", section)
+        if match:
+            raw_weights[canonical_name] = float(match.group(1)) / 100
+
+    bucket_totals: dict[str, float] = {}
+    for canonical_name, weight in raw_weights.items():
+        bucket = NQ_SECTOR_ALIASES[canonical_name]
+        bucket_totals[bucket] = bucket_totals.get(bucket, 0.0) + weight
+
+    exposures = {
+        column: bucket_totals.get(bucket, 0.0) for bucket, column in NQ_BUCKET_TO_EXPOSURE_COLUMN.items()
+    }
+    exposures["High Quality Proxy"] = exposures["Government Related"] + exposures["Agency MBS"]
+    exposures["Spread Risk Proxy"] = (
+        exposures["Non-Agency MBS"] + exposures["ABS / CLO"] + exposures["Credit & Loans"]
+    )
+
+    summary = {
+        "Report Date": report_date,
+        "Net Assets": net_assets,
+        "Gross / Net": gross_to_net,
+        "Effective Duration": np.nan,
+        "3M KRD": np.nan,
+        "1Y KRD": np.nan,
+        "5Y KRD": np.nan,
+        "10Y KRD": np.nan,
+        "30Y KRD": np.nan,
+        "Source": "N-Q (pre-2019 sector weights; no dv01/KRD)",
+        **exposures,
+    }
+    return summary, raw_weights
 
 
 def discover_bond_filings(max_periods: int = 16) -> list[dict]:
