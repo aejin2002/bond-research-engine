@@ -332,6 +332,116 @@ def parse_nq_filing(
     return summary, raw_weights
 
 
+# --- Pre-2019 N-Q pipeline: discover, fetch, parse, merge -----------------
+# EDGAR full-text search (used by discover_bond_filings below) only indexes
+# NPORT-P from 2019 onward for this CIK. N-Q accessions were confirmed
+# directly from the EDGAR filing browser for CIK 1450011 (see conversation);
+# BOND launched 2012-03-01 so 2012-03-31 is the first quarter it appears in.
+# Report dates alternate Mar 31 (filed ~May, fiscal Q3) / Sep 30 (filed
+# ~Nov, fiscal Q1), since PIMCO ETF Trust's fiscal year end is June 30 and
+# N-Q only covered the first and third fiscal quarters.
+NQ_FILING_ACCESSIONS: list[dict] = [
+    {"accession": "0001193125-12-252713", "report_date": "2012-03-31"},
+    {"accession": "0001193125-12-484330", "report_date": "2012-09-30"},
+    {"accession": "0001193125-13-240998", "report_date": "2013-03-31"},
+    {"accession": "0001193125-13-456836", "report_date": "2013-09-30"},
+    {"accession": "0001193125-14-216653", "report_date": "2014-03-31"},
+    {"accession": "0001193125-14-425592", "report_date": "2014-09-30"},
+    {"accession": "0001193125-15-205904", "report_date": "2015-03-31"},
+    {"accession": "0001193125-15-387397", "report_date": "2015-09-30"},
+    {"accession": "0001193125-16-606183", "report_date": "2016-03-31"},
+    {"accession": "0001193125-16-778260", "report_date": "2016-09-30"},
+    {"accession": "0001193125-17-185799", "report_date": "2017-03-31"},
+    {"accession": "0001193125-17-353855", "report_date": "2017-09-30"},
+    {"accession": "0001193125-18-178477", "report_date": "2018-03-31"},
+    {"accession": "0001193125-18-335284", "report_date": "2018-09-30"},
+]
+
+
+def _accession_plain(accession: str) -> str:
+    return accession.replace("-", "")
+
+
+def _nq_filing_index(accession: str) -> dict:
+    url = f"{SEC_ARCHIVES}/{BOND_CIK}/{_accession_plain(accession)}/index.json"
+    return json.loads(_sec_request(url))
+
+
+def _nq_primary_document_url(accession: str) -> str:
+    """Find the N-Q primary document's filename within its accession folder.
+
+    Filenames are opaque (e.g. "d11139dnq.htm") and vary per filing, so this
+    reads the accession's own index.json rather than guessing a pattern.
+    """
+    index = _nq_filing_index(accession)
+    items = index.get("directory", {}).get("item", [])
+    candidates = [item["name"] for item in items if str(item.get("type", "")).upper().startswith("N-Q")]
+    if not candidates:
+        candidates = [
+            item["name"] for item in items if re.search(r"nq\.(htm|txt)$", item.get("name", ""), re.IGNORECASE)
+        ]
+    if not candidates:
+        raise ValueError(f"{accession}: index.json에서 N-Q 주 문서를 찾지 못했습니다.")
+    return f"{SEC_ARCHIVES}/{BOND_CIK}/{_accession_plain(accession)}/{candidates[0]}"
+
+
+def _fetch_nq_document(accession: str) -> bytes:
+    cache_path = CACHE_DIR / f"sec_bond_nq_{accession}.htm"
+    if cache_path.exists():
+        return cache_path.read_bytes()
+    payload = _sec_request(_nq_primary_document_url(accession), timeout=60)
+    cache_path.write_bytes(payload)
+    return payload
+
+
+def build_pre2019_nq_history(
+    accessions: list[dict] | None = None, fund_pattern: re.Pattern = NQ_BOND_FUND_NAME_PATTERN
+) -> tuple[pd.DataFrame, list[str]]:
+    """Fetch and parse every pre-2019 N-Q filing, returning a history frame.
+
+    Each row's columns match parse_nq_filing()'s summary dict (sector
+    weights already rescaled onto N-PORT's 100%-sum basis; Effective
+    Duration/KRDs are NaN since N-Q never reported them). Failures on
+    individual filings are collected rather than aborting the whole run,
+    matching fetch_bond_exposure_history()'s error-tolerant style.
+    """
+    accessions = accessions if accessions is not None else NQ_FILING_ACCESSIONS
+    rows: dict[pd.Timestamp, dict] = {}
+    errors: list[str] = []
+    for entry in accessions:
+        try:
+            payload = _fetch_nq_document(entry["accession"])
+            summary, _ = parse_nq_filing(payload, fund_pattern)
+            date = summary["Report Date"] or pd.Timestamp(entry["report_date"])
+            summary["Report Date"] = date
+            summary["Accession"] = entry["accession"]
+            rows[date] = summary
+        except Exception as exc:
+            errors.append(f"{entry['report_date']} ({entry['accession']}): {type(exc).__name__}: {exc}")
+    if not rows:
+        return pd.DataFrame(), errors
+    history = pd.DataFrame(rows.values()).set_index("Report Date").sort_index()
+    return history, errors
+
+
+def extend_seed_with_pre2019_nq(
+    accessions: list[dict] | None = None, fund_pattern: re.Pattern = NQ_BOND_FUND_NAME_PATTERN
+) -> tuple[pd.DataFrame, list[str]]:
+    """Fetch pre-2019 N-Q history and merge it into data/pimco_bond_sec_history.csv.
+
+    N-PORT-derived rows (2019+) always win on a shared date; N-Q only fills
+    in dates the existing seed doesn't already have, so re-running this is
+    safe and idempotent.
+    """
+    nq_history, errors = build_pre2019_nq_history(accessions, fund_pattern)
+    seed = _read_seed()
+    if nq_history.empty:
+        return seed, errors
+    combined = pd.concat([nq_history[~nq_history.index.isin(seed.index)], seed]).sort_index()
+    write_seed(combined)
+    return combined, errors
+
+
 def discover_bond_filings(max_periods: int = 16) -> list[dict]:
     params = urllib.parse.urlencode(
         {
