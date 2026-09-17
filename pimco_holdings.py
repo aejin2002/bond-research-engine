@@ -238,13 +238,21 @@ def _slice_fund_section(text: str, fund_pattern: re.Pattern) -> str:
     if not headings:
         raise ValueError("N-Q 문서에서 'Schedule of Investments' 섹션을 찾지 못했습니다 (포맷이 다를 수 있음, 또는 N-Q가 아닌 다른 문서일 수 있음).")
     # PIMCO ETF Trust N-Q filings bundle every series in one document, in the
-    # order listed in the Item 1 table of contents.
+    # order listed in the Item 1 table of contents. Item 1 itself opens with
+    # its own "Schedule of Investments" heading followed by a "Table of
+    # Contents" listing every fund name in the filing (including ours) before
+    # any real per-fund section appears -- searching the whole span up to the
+    # next heading falsely matches that listing. A genuine per-fund heading
+    # instead has the fund's name immediately after it (then a report date),
+    # so only look in a short window right after each heading.
+    HEADING_LOOKAHEAD = 300
     for index, start in enumerate(headings):
-        end = headings[index + 1] if index + 1 < len(headings) else min(start + 6000, len(text))
-        window = text[start:end]
+        end = headings[index + 1] if index + 1 < len(headings) else len(text)
+        window = text[start:min(start + HEADING_LOOKAHEAD, end)]
+        if "Table of Contents" in window:
+            continue
         if fund_pattern.search(window):
-            section_end = headings[index + 1] if index + 1 < len(headings) else len(text)
-            return text[start:section_end]
+            return text[start:end]
     raise ValueError(f"'{fund_pattern.pattern}' 패턴에 맞는 펀드 섹션을 N-Q 필링에서 찾지 못했습니다.")
 
 
