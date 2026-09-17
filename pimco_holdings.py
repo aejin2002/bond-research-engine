@@ -176,7 +176,18 @@ def parse_nport_xml(payload: bytes) -> tuple[dict, pd.DataFrame]:
 # individual holdings — we read PIMCO's own published sector percentages.
 # There is no dv01/KRD data in this era, so Effective Duration and the KRD
 # columns are left absent (NaN) for these rows.
-NQ_BOND_FUND_NAME = "PIMCO Total Return Exchange"
+#
+# The fund's own shareholder-facing name changed mid-history: it was "PIMCO
+# Total Return Exchange-Traded Fund" through ~2015, then "PIMCO Total Return
+# Active Exchange-Traded Fund" once PIMCO added "Active" branding to its ETF
+# lineup after Bill Gross's departure (confirmed from a 2015 fidelity-bond
+# filing listing "PIMCO Total Return Active Exchange-Traded Fund"), before
+# eventually becoming "PIMCO Active Bond ETF" (unrelated to N-Q, which ended
+# in 2019). "Active" is therefore optional in this pattern.
+NQ_BOND_FUND_NAME_PATTERN = re.compile(
+    r"PIMCO\s+Total\s+Return(?:\s+Active)?\s+Exchange[\s‐‑‒–—―-]*Traded\s+Fund",
+    re.IGNORECASE,
+)
 
 # Canonical N-Q "Schedule of Investments" category headers -> internal bucket.
 # Sub-category breakdowns nested under a header (e.g. "BANKING & FINANCE"
@@ -222,25 +233,24 @@ def _strip_html_to_text(payload: bytes) -> str:
     return text
 
 
-def _slice_fund_section(text: str, fund_name: str) -> str:
+def _slice_fund_section(text: str, fund_pattern: re.Pattern) -> str:
     headings = [m.start() for m in re.finditer(r"Schedule of Investments", text)]
     if not headings:
-        raise ValueError("N-Q 문서에서 'Schedule of Investments' 섹션을 찾지 못했습니다 (포맷이 다를 수 있음).")
+        raise ValueError("N-Q 문서에서 'Schedule of Investments' 섹션을 찾지 못했습니다 (포맷이 다를 수 있음, 또는 N-Q가 아닌 다른 문서일 수 있음).")
     # PIMCO ETF Trust N-Q filings bundle every series in one document, in the
-    # order listed in the Item 1 table of contents; the fund name may use a
-    # hyphen or an en-dash ("Exchange-Traded" vs "Exchange–Traded"), so match
-    # loosely rather than on an exact literal.
-    loose_pattern = re.compile(re.escape(fund_name).replace(r"\ ", r"[\s‐-―-]+"))
+    # order listed in the Item 1 table of contents.
     for index, start in enumerate(headings):
         end = headings[index + 1] if index + 1 < len(headings) else min(start + 6000, len(text))
         window = text[start:end]
-        if fund_name in window or loose_pattern.search(window):
+        if fund_pattern.search(window):
             section_end = headings[index + 1] if index + 1 < len(headings) else len(text)
             return text[start:section_end]
-    raise ValueError(f"'{fund_name}' 섹션을 N-Q 필링에서 찾지 못했습니다.")
+    raise ValueError(f"'{fund_pattern.pattern}' 패턴에 맞는 펀드 섹션을 N-Q 필링에서 찾지 못했습니다.")
 
 
-def parse_nq_filing(payload: bytes, fund_name: str = NQ_BOND_FUND_NAME) -> tuple[dict, dict[str, float]]:
+def parse_nq_filing(
+    payload: bytes, fund_pattern: re.Pattern = NQ_BOND_FUND_NAME_PATTERN
+) -> tuple[dict, dict[str, float]]:
     """Parse a pre-2019 N-Q filing's sector weights for one series within it.
 
     Unlike parse_nport_xml(), this does not sum individual holdings: N-Q
@@ -252,7 +262,7 @@ def parse_nq_filing(payload: bytes, fund_name: str = NQ_BOND_FUND_NAME) -> tuple
     (callers should treat them as NaN).
     """
     text = _strip_html_to_text(payload)
-    section = _slice_fund_section(text, fund_name)
+    section = _slice_fund_section(text, fund_pattern)
 
     report_date = None
     period_match = re.search(r"Date of reporting period:\s*([A-Za-z]+ \d{1,2},\s*\d{4})", text)
