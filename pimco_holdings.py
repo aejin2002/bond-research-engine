@@ -198,6 +198,7 @@ NQ_SECTOR_ALIASES: dict[str, str] = {
     "CORPORATE BONDS & NOTES": "credit",
     "CONVERTIBLE BONDS & NOTES": "credit",
     "SOVEREIGN ISSUES": "credit",
+    "BANK LOAN OBLIGATIONS": "credit",
     "MUNICIPAL BONDS & NOTES": "muni",
     "U.S. TREASURY OBLIGATIONS": "govt",
     # PIMCO's N-Q "U.S. GOVERNMENT AGENCIES" bucket is overwhelmingly agency
